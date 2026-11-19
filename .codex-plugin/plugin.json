@@ -1,0 +1,47 @@
+{
+  "name": "context-graph",
+  "version": "0.1.0",
+  "description": "Unified Context Graph, Project Brain, Memory Bank, session handoffs, and SHA-256 attested export/import bundles.",
+  "author": {
+    "name": "AI-Infrastructure Contributors",
+    "url": "https://github.com/Alex-Caepio/context-graph"
+  },
+  "homepage": "https://github.com/Alex-Caepio/context-graph",
+  "repository": "https://github.com/Alex-Caepio/context-graph",
+  "license": "MIT",
+  "keywords": [
+    "context-graph",
+    "knowledge-graph",
+    "project-brain",
+    "memory-bank",
+    "handoff",
+    "export",
+    "import"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.codex-mcp.json",
+  "hooks": "./hooks/codex-hooks.json",
+  "interface": {
+    "displayName": "Context Graph",
+    "shortDescription": "Unified context graph, persistent memory, handoffs, and portable bundle transfer.",
+    "longDescription": "Standalone framework-agnostic Context Graph, Project Brain, Memory Bank, session continuity, and SHA-256 attested export/import bundle engine with native stdio MCP server, CLI, hooks, and skills.",
+    "developerName": "AI-Infrastructure",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write",
+      "Instructions",
+      "Lifecycle hooks"
+    ],
+    "defaultPrompt": [
+      "Query the context graph for dependencies and provenance of the current task",
+      "Export a privacy-filtered context bundle for transfer to another repository",
+      "Save a portable session handoff with next steps and cited files"
+    ],
+    "brandColor": "#2563EB",
+    "composerIcon": "./assets/logo.svg",
+    "logo": "./assets/logo.svg",
+    "screenshots": []
+  }
+}

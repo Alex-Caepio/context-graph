@@ -1,0 +1,53 @@
+{
+  "description": "Context Graph working memory, local context banner, and chat continuity hooks",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/context-graph-engine hook claude local-context --root .",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/context-graph-engine hook claude context-continuity --root .",
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/context-graph-engine hook claude working-memory-read --root .",
+            "timeout": 8
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/context-graph-engine hook claude context-continuity --root .",
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/context-graph-engine hook claude working-memory-write --root .",
+            "timeout": 8
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/context-graph-engine hook claude context-continuity --root .",
+            "timeout": 8
+          }
+        ]
+      }
+    ]
+  }
+}

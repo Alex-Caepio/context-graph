@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "crates/memory-kernel-probe",
+    "crates/context-graph-core",
+    "crates/context-graph-cli",
+]
+default-members = ["crates/context-graph-cli"]
+resolver = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.test]
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 3

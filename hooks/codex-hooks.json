@@ -1,0 +1,55 @@
+{
+  "description": "Codex Context Graph working memory, local context, and chat continuity hooks",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${PLUGIN_ROOT}/bin/context-graph-engine hook codex local-context --root .",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "${PLUGIN_ROOT}/bin/context-graph-engine hook codex context-continuity --root .",
+            "timeout": 8,
+            "additionalContextLimit": 6000
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${PLUGIN_ROOT}/bin/context-graph-engine hook codex working-memory-read --root .",
+            "timeout": 8,
+            "additionalContextLimit": 4000
+          },
+          {
+            "type": "command",
+            "command": "${PLUGIN_ROOT}/bin/context-graph-engine hook codex context-continuity --root .",
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${PLUGIN_ROOT}/bin/context-graph-engine hook codex working-memory-write --root .",
+            "timeout": 8
+          },
+          {
+            "type": "command",
+            "command": "${PLUGIN_ROOT}/bin/context-graph-engine hook codex context-continuity --root .",
+            "timeout": 8
+          }
+        ]
+      }
+    ]
+  }
+}

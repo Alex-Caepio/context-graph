@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "context-graph": {
+      "command": "./bin/context-graph-engine",
+      "cwd": ".",
+      "args": ["mcp"],
+      "tool_timeout_sec": 900
+    }
+  }
+}

@@ -1,0 +1,19 @@
+[package]
+name = "context-graph-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+description = "Standalone CLI, MCP server, and hooks runtime for context-graph"
+
+[[bin]]
+name = "context-graph-engine"
+path = "src/main.rs"
+
+[dependencies]
+context-graph-core = { path = "../context-graph-core" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = { version = "=1.0.150", features = ["preserve_order", "arbitrary_precision", "raw_value"] }
+chrono = "=0.4.45"
+libc = "=0.2.191"
+regex = "1"

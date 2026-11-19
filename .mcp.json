@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "context-graph": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/context-graph-engine",
+      "args": ["mcp"]
+    }
+  }
+}

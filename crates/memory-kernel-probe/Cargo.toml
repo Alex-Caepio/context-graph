@@ -1,0 +1,16 @@
+[package]
+name = "memory-kernel-probe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+description = "Native memory primitive compatibility contracts"
+
+[lib]
+name = "memory_kernel_probe"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = { version = "=1.0.150" }
+sha2 = "=0.11.0"

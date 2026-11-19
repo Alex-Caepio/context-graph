@@ -1,0 +1,25 @@
+{
+  "name": "context-graph",
+  "version": "0.1.0",
+  "description": "Unified Context Graph, Project Brain, Memory Bank, session handoffs, and SHA-256 attested export/import bundles.",
+  "author": {
+    "name": "AI-Infrastructure Contributors",
+    "url": "https://github.com/Alex-Caepio/context-graph"
+  },
+  "homepage": "https://github.com/Alex-Caepio/context-graph",
+  "repository": "https://github.com/Alex-Caepio/context-graph",
+  "license": "MIT",
+  "keywords": [
+    "context-graph",
+    "knowledge-graph",
+    "project-brain",
+    "memory-bank",
+    "handoff",
+    "export",
+    "import"
+  ],
+  "commands": "./commands/",
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json"
+}

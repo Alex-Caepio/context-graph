@@ -1,0 +1,21 @@
+[package]
+name = "context-graph-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+description = "Framework-agnostic context graph, Project Brain, Memory Bank, handoff, and bundle engine"
+
+[dependencies]
+memory-kernel-probe = { path = "../memory-kernel-probe" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = { version = "=1.0.150", features = ["preserve_order", "arbitrary_precision", "raw_value"] }
+uuid = { version = "=1.22.0", features = ["v4"] }
+chrono = "=0.4.45"
+libc = "=0.2.191"
+regex = "1"
+rusqlite = { version = "=0.37.0", features = ["bundled", "modern_sqlite", "functions"] }
+sha2 = "=0.11.0"
+unicode-casefold = "=0.2.0"
+fancy-regex = "0.14"
+zip = { version = "=0.6.6", default-features = false, features = ["deflate"] }
