@@ -17,9 +17,5 @@
     "handoff",
     "export",
     "import"
-  ],
-  "commands": "./commands/",
-  "skills": "./skills/",
-  "hooks": "./hooks/hooks.json",
-  "mcpServers": "./.mcp.json"
+  ]
 }
