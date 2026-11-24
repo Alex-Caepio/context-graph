@@ -356,7 +356,7 @@ fn mcp_binary_refuses_omitted_project_when_cwd_is_plugin_dir_under_ancestor_git(
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
     assert_eq!(responses.len(), 5);
-    assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 11);
+    assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 17);
     assert_eq!(responses[2]["result"]["isError"], true, "{:#}", responses[2]);
     assert_eq!(responses[3]["result"]["isError"], true, "{:#}", responses[3]);
     assert_eq!(
@@ -369,4 +369,183 @@ fn mcp_binary_refuses_omitted_project_when_cwd_is_plugin_dir_under_ancestor_git(
     assert!(!plugin_dir.join("memory-bank").exists());
     assert!(!tmp.0.join("memory-bank").exists());
     assert!(!tmp.0.join("project-brain").exists());
+}
+
+#[test]
+fn omnigraph_cli_sync_branch_diff_keep_bridge_and_promote_roundtrip() {
+    let tmp = TempDir(std::env::temp_dir().join(format!("cg-omni-cli-{}", uuid4())));
+    let repo = tmp.0.join("repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::create_dir_all(repo.join("project-brain/schemas")).unwrap();
+    fs::create_dir_all(repo.join("memory-bank/chunks")).unwrap();
+    fs::write(
+        repo.join("src/OrderService.php"),
+        "<?php\nclass OrderService {\n    public function issueInvoice(): void {}\n}\n",
+    )
+    .unwrap();
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../context-graph-core/schemas/dynamic-record.schema.json"),
+        repo.join("project-brain/schemas/dynamic-record.schema.json"),
+    )
+    .unwrap();
+
+    let r = repo.to_str().unwrap();
+
+    // Publish atom on main with SymbolRef linkage
+    let pub_main = run_cli(
+        &repo,
+        &[
+            "omnigraph",
+            "publish",
+            "--root",
+            r,
+            "--atom-id",
+            "atom-inv",
+            "--kind",
+            "decision",
+            "--title",
+            "Invoice idempotency",
+            "--body",
+            "OrderService::issueInvoice requires an idempotency key.",
+            "--file",
+            "src/OrderService.php",
+        ],
+        None,
+    );
+    assert!(
+        pub_main.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pub_main.stderr)
+    );
+    let pub_json: Value = serde_json::from_slice(&pub_main.stdout).unwrap();
+    assert!(
+        pub_json["atom"]["symbols"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str().unwrap().contains("issueInvoice")),
+        "{:#}",
+        pub_json
+    );
+
+    // Branch, edit on both sides, branch-diff -> conflict, merge-keep -> resolved
+    let br = run_cli(&repo, &["omnigraph", "branch-create", "--root", r, "--name", "session/s1"], None);
+    assert!(br.status.success());
+
+    let e1 = run_cli(
+        &repo,
+        &[
+            "omnigraph",
+            "publish",
+            "--root",
+            r,
+            "--branch",
+            "session/s1",
+            "--atom-id",
+            "atom-inv",
+            "--kind",
+            "decision",
+            "--title",
+            "Invoice idempotency via header",
+            "--body",
+            "OrderService::issueInvoice requires X-Idempotency-Key.",
+            "--file",
+            "src/OrderService.php",
+        ],
+        None,
+    );
+    assert!(e1.status.success());
+
+    let e2 = run_cli(
+        &repo,
+        &[
+            "omnigraph",
+            "publish",
+            "--root",
+            r,
+            "--branch",
+            "main",
+            "--atom-id",
+            "atom-inv",
+            "--kind",
+            "decision",
+            "--title",
+            "Invoice idempotency via DB token",
+            "--body",
+            "OrderService::issueInvoice checks ledger table.",
+            "--file",
+            "src/OrderService.php",
+        ],
+        None,
+    );
+    assert!(e2.status.success());
+
+    let diff = run_cli(
+        &repo,
+        &["omnigraph", "branch-diff", "--root", r, "--source", "session/s1", "--target", "main"],
+        None,
+    );
+    assert!(diff.status.success());
+    let diff_json: Value = serde_json::from_slice(&diff.stdout).unwrap();
+    assert_eq!(diff_json["outcome"], "conflict");
+
+    let mk = run_cli(
+        &repo,
+        &[
+            "omnigraph",
+            "merge-keep",
+            "--root",
+            r,
+            "--source",
+            "session/s1",
+            "--target",
+            "main",
+            "--strategy",
+            "keep_source",
+        ],
+        None,
+    );
+    assert!(mk.status.success());
+    let mk_json: Value = serde_json::from_slice(&mk.stdout).unwrap();
+    assert_eq!(mk_json["outcome"], "merged");
+
+    // Promote safe atom to Project Brain + sync-canonical + memory-links
+    let prom = run_cli(
+        &repo,
+        &[
+            "omnigraph",
+            "promote-atom",
+            "--root",
+            r,
+            "--atom-id",
+            "atom-inv",
+            "--title",
+            "Invoice idempotency via header",
+            "--body",
+            "OrderService::issueInvoice requires X-Idempotency-Key.",
+            "--file",
+            "src/OrderService.php",
+            "--kind",
+            "decision",
+            "--privacy",
+            "team",
+        ],
+        None,
+    );
+    assert!(prom.status.success(), "{}", String::from_utf8_lossy(&prom.stderr));
+
+    let sync = run_cli(&repo, &["omnigraph", "sync-canonical", "--root", r], None);
+    assert!(sync.status.success(), "{}", String::from_utf8_lossy(&sync.stderr));
+    let sync_json: Value = serde_json::from_slice(&sync.stdout).unwrap();
+    assert!(sync_json["synced"].as_u64().unwrap() >= 1);
+
+    let links = run_cli(
+        &repo,
+        &["memory-links", "--root", r, "--path", "src/OrderService.php"],
+        None,
+    );
+    assert!(links.status.success());
+    let links_json: Value = serde_json::from_slice(&links.stdout).unwrap();
+    assert_eq!(links_json["items"][0]["brain_records"].as_array().unwrap().len(), 1);
 }

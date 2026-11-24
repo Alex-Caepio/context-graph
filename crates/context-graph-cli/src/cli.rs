@@ -5,7 +5,9 @@ use context_graph_core::{
     RuntimeContext, RuntimeError, Store,
     bundle::{self, BundleFormat, ExportRequest, ImportRequest, ImportStrategy},
     graph::{self, Direction, GraphQuery},
-    index, storage,
+    index,
+    omnigraph::{self, OmnigraphEngine},
+    storage,
 };
 use serde_json::{Map, Value};
 use std::{
@@ -26,12 +28,14 @@ USAGE:
 
 COMMANDS:
   graph <query|links|export-dot|sync>   Traverse N-hop context graph, lineage, impact, or DOT
+  omnigraph <SUBCMD> [OPTIONS]          Embedded Omnigraph branch DAG, canonical sync, diff & keep merge
+  memory-links [OPTIONS]                Resolve Brain/Bank citations, rename drift & contradictions
   export                                Export portable privacy-filtered context-graph-bundle-v1
   import                                Validate/dry-run/import a context-graph-bundle-v1 bundle
   memory [GLOBAL_OPTS] <OP> [ARGS]      Project Brain, Memory Bank, working memory, handoffs
   hook [claude|codex|cursor] <ROLE>     Run native working-memory / continuity hook from stdin
   collect-context [OPTIONS]             Wrap code2prompt safely for context collection
-  mcp [OPTIONS]                         Run stdio JSON-RPC 2.0 MCP server (11 tools)
+  mcp [OPTIONS]                         Run stdio JSON-RPC 2.0 MCP server (17 tools)
   --help, -h                            Show help
   --version, -V                         Print version
 
@@ -43,6 +47,25 @@ GRAPH SUBCOMMANDS:
                    [--kinds K1,K2] [--include-archived]
   graph sync [--root DIR] [--json]
 
+OMNIGRAPH SUBCOMMANDS:
+  omnigraph status [--root DIR] [--project-id ID] [--json]
+  omnigraph sync-canonical [--root DIR] [--project-id ID] [--no-prune] [--input-json JSON|-] [--json]
+  omnigraph file-context --path PATH [--branch BRANCH] [--root DIR] [--project-id ID] [--json]
+  omnigraph atoms [--branch BRANCH] [--kind KIND] [--q QUERY] [--limit N] [--offset N] [--json]
+  omnigraph publish [--branch BRANCH] [--atom-id ID] [--kind KIND] --title TEXT [--body TEXT] [--file PATH]... [--session-id ID] [--relates-to ID --relation REL] [--input-json JSON|-]
+  omnigraph share --target-session-id ID --atom-id ID... [--branch BRANCH] [--json]
+  omnigraph branch-create --name BRANCH [--from BASE] [--json]
+  omnigraph branch-delete --name BRANCH [--json]
+  omnigraph branch-diff --source BRANCH [--target BRANCH] [--json]
+  omnigraph merge-keep --source BRANCH [--target BRANCH] [--strategy merge|keep_source|keep_target] [--atom-id ID]... [--dry-run] [--delete-branch]
+  omnigraph export-ndjson [--branch BRANCH] [--scope all|branch|session] [--include-inherited] [--json]
+  omnigraph import-ndjson [--branch BRANCH] [--input FILE|-] [--json]
+  omnigraph promote-atom [--input-json JSON|-] [--atom-id ID --title TEXT --body TEXT --file PATH... --kind finding|decision|bug|incident --privacy public|team]
+  omnigraph schema [--output-dir DIR]
+
+MEMORY LINKS:
+  memory-links --path PATH [--previous-path OLD] [--file PATH]... [--files JSON] [--root DIR] [--json]
+
 EXPORT / IMPORT OPTIONS:
   export --destination PATH [--root DIR] [--format dir|zip] [--subgraph-root ID]
          [--depth N] [--include-archive] [--include-superseded] [--no-handoffs]
@@ -53,8 +76,7 @@ EXPORT / IMPORT OPTIONS:
 }
 
 fn is_plugin_dir(dir: &Path) -> bool {
-    dir.join(".codex-plugin/plugin.json").is_file()
-        || dir.join(".claude-plugin/plugin.json").is_file()
+    context_graph_core::mcp::is_plugin_dir(dir)
 }
 
 fn read_stdin_capped() -> Result<Vec<u8>> {
@@ -785,12 +807,23 @@ fn run_memory(args: &[String]) -> Result<i32> {
                     return Err(RuntimeError::invalid("--revision must be positive integer or auto"));
                 }
             }
-            "--flush-after" | "--max-files" | "--since-seq" | "--window" | "--since" | "--max-tokens" => {
+            "--limit" | "--flush-after" | "--max-files" | "--since-seq" | "--window" | "--since" | "--max-tokens" => {
                 let key = flag.trim_start_matches("--").replace('-', "_");
                 let n = next_val(args, &mut i, flag)?
                     .parse::<u64>()
                     .map_err(|_| RuntimeError::invalid(format!("{flag} must be a non-negative integer")))?;
                 req.insert(key, Value::from(n));
+            }
+            "--proposal-id" | "--promotion-id" => {
+                let v = next_val(args, &mut i, flag)?.to_string();
+                req.insert("promotion_id".into(), Value::String(v));
+            }
+            "--decision" => {
+                let v = next_val(args, &mut i, flag)?.trim().to_ascii_lowercase();
+                req.insert("decision".into(), Value::String(v.clone()));
+                if matches!(v.as_str(), "reject" | "rejected" | "deny" | "denied") {
+                    req.insert("reject".into(), Value::Bool(true));
+                }
             }
             "--confidence" => {
                 let f = next_val(args, &mut i, flag)?
@@ -844,6 +877,9 @@ fn run_memory(args: &[String]) -> Result<i32> {
             "links" => {
                 req.entry("target").or_insert_with(|| Value::String(first.clone()));
             }
+            "promote-review" | "promote-apply" => {
+                req.entry("promotion_id").or_insert_with(|| Value::String(first.clone()));
+            }
             _ => {
                 req.entry("task_id").or_insert_with(|| Value::String(first.clone()));
             }
@@ -893,6 +929,8 @@ pub fn dispatch(args: &[String]) -> Result<i32> {
         }
         "mcp" => run_mcp(&args[1..]),
         "graph" => run_graph(&args[1..]),
+        "omnigraph" => run_omnigraph(&args[1..]),
+        "memory-links" => run_memory_links(&args[1..]),
         "export" => run_export(&args[1..]),
         "import" => run_import(&args[1..]),
         "hook" => run_hook(&args[1..]),
@@ -901,5 +939,468 @@ pub fn dispatch(args: &[String]) -> Result<i32> {
         other => Err(RuntimeError::invalid(format!(
             "Unknown command '{other}'. Run with --help for usage."
         ))),
+    }
+}
+
+fn default_project_id(ctx: &RuntimeContext, explicit: Option<&str>) -> String {
+    explicit
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            ctx.roots
+                .project
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("default")
+                .to_string()
+        })
+}
+
+fn run_memory_links(args: &[String]) -> Result<i32> {
+    let mut root: Option<PathBuf> = None;
+    let mut project: Option<PathBuf> = None;
+    let mut project_id: Option<String> = None;
+    let mut previous_path: Option<String> = None;
+    let mut paths: Vec<String> = Vec::new();
+    let mut specs: Vec<(String, Option<String>)> = Vec::new();
+    let mut _as_json = true;
+
+    let mut i = 0;
+    while i < args.len() {
+        let raw = &args[i];
+        let (flag, _) = split_flag_arg(raw);
+        match flag {
+            "-h" | "--help" => {
+                println!("{}", help_text());
+                return Ok(0);
+            }
+            "--root" => root = Some(PathBuf::from(next_val(args, &mut i, flag)?)),
+            "--project" => project = Some(PathBuf::from(next_val(args, &mut i, flag)?)),
+            "--project-id" => project_id = Some(next_val(args, &mut i, flag)?.into()),
+            "--path" | "--file" => paths.push(next_val(args, &mut i, flag)?.into()),
+            "--previous-path" => previous_path = Some(next_val(args, &mut i, flag)?.into()),
+            "--files" => {
+                let raw_json = next_val(args, &mut i, flag)?;
+                let parsed: Value = serde_json::from_str(raw_json)?;
+                if let Some(arr) = parsed.as_array() {
+                    for entry in arr {
+                        if let Some(s) = entry.as_str() {
+                            specs.push((s.to_string(), None));
+                        } else if let Some(p) = entry["path"].as_str() {
+                            specs.push((
+                                p.to_string(),
+                                entry["previous_path"].as_str().map(str::to_string),
+                            ));
+                        }
+                    }
+                }
+            }
+            "--json" => _as_json = true,
+            other if !other.starts_with('-') => paths.push(other.into()),
+            other => return Err(RuntimeError::invalid(format!("Unknown memory-links option: {other}"))),
+        }
+        i += 1;
+    }
+
+    for (idx, p) in paths.into_iter().enumerate() {
+        let prev = if idx == 0 { previous_path.take() } else { None };
+        specs.push((p, prev));
+    }
+    if specs.is_empty() {
+        return Err(RuntimeError::invalid(
+            "memory-links requires --path <PATH> (or --files JSON)",
+        ));
+    }
+
+    let ctx = build_context(root.as_deref(), project.as_deref(), None, None, false)?;
+    let pid = default_project_id(&ctx, project_id.as_deref());
+    let eng = OmnigraphEngine::open(&ctx).ok();
+    let res = omnigraph::bridge::memory_links_for_files(&ctx, &pid, &specs, eng.as_ref())?;
+    print_json(&res)
+}
+
+fn run_omnigraph(args: &[String]) -> Result<i32> {
+    let sub = args.first().map(String::as_str).unwrap_or("status");
+    if matches!(sub, "-h" | "--help") {
+        println!("{}", help_text());
+        return Ok(0);
+    }
+    let start_idx = if matches!(
+        sub,
+        "status"
+            | "sync-canonical"
+            | "file-context"
+            | "atoms"
+            | "publish"
+            | "share"
+            | "branch-create"
+            | "branch-delete"
+            | "branch-diff"
+            | "merge-keep"
+            | "export-ndjson"
+            | "import-ndjson"
+            | "promote-atom"
+            | "schema"
+    ) {
+        1
+    } else {
+        return Err(RuntimeError::invalid(format!(
+            "Unknown omnigraph subcommand '{sub}'. Run with --help."
+        )));
+    };
+
+    let mut root: Option<PathBuf> = None;
+    let mut project: Option<PathBuf> = None;
+    let mut project_id: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut target_branch: Option<String> = None;
+    let mut source_branch: Option<String> = None;
+    let mut from_branch: Option<String> = None;
+    let mut to_branch: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut path: Option<String> = None;
+    let mut kind: Option<String> = None;
+    let mut query: Option<String> = None;
+    let mut atom_id: Option<String> = None;
+    let mut atom_ids: Vec<String> = Vec::new();
+    let mut title: Option<String> = None;
+    let mut summary: Option<String> = None;
+    let mut body_text: Option<String> = None;
+    let mut files: Vec<String> = Vec::new();
+    let mut session_id: Option<String> = None;
+    let mut target_session_id: Option<String> = None;
+    let mut relates_to: Option<String> = None;
+    let mut relation: Option<String> = None;
+    let mut strategy = "merge".to_string();
+    let mut scope = "all".to_string();
+    let mut privacy: Option<String> = None;
+    let mut expected_updated_at: Option<String> = None;
+    let mut replaced_updated_at: Option<String> = None;
+    let mut input_json: Option<Value> = None;
+    let mut input_path: Option<String> = None;
+    let mut output_dir: Option<PathBuf> = None;
+    let mut prune = true;
+    let mut include_inherited = true;
+    let mut dry_run = false;
+    let mut delete_branch = false;
+    let mut limit: usize = 50;
+    let mut offset: usize = 0;
+
+    let mut i = start_idx;
+    while i < args.len() {
+        let raw = &args[i];
+        let (flag, _) = split_flag_arg(raw);
+        match flag {
+            "-h" | "--help" => {
+                println!("{}", help_text());
+                return Ok(0);
+            }
+            "--root" => root = Some(PathBuf::from(next_val(args, &mut i, flag)?)),
+            "--project" => project = Some(PathBuf::from(next_val(args, &mut i, flag)?)),
+            "--project-id" => project_id = Some(next_val(args, &mut i, flag)?.into()),
+            "--branch" => branch = Some(next_val(args, &mut i, flag)?.into()),
+            "--source" => source_branch = Some(next_val(args, &mut i, flag)?.into()),
+            "--target" => target_branch = Some(next_val(args, &mut i, flag)?.into()),
+            "--from" => from_branch = Some(next_val(args, &mut i, flag)?.into()),
+            "--to" => to_branch = Some(next_val(args, &mut i, flag)?.into()),
+            "--name" => name = Some(next_val(args, &mut i, flag)?.into()),
+            "--path" => path = Some(next_val(args, &mut i, flag)?.into()),
+            "--kind" => kind = Some(next_val(args, &mut i, flag)?.into()),
+            "--q" | "--query" => query = Some(next_val(args, &mut i, flag)?.into()),
+            "--atom-id" => {
+                let v = next_val(args, &mut i, flag)?.to_string();
+                atom_id = Some(v.clone());
+                atom_ids.push(v);
+            }
+            "--title" => title = Some(next_val(args, &mut i, flag)?.into()),
+            "--summary" => summary = Some(next_val(args, &mut i, flag)?.into()),
+            "--body" => body_text = Some(next_val(args, &mut i, flag)?.into()),
+            "--file" => files.push(next_val(args, &mut i, flag)?.into()),
+            "--session-id" => session_id = Some(next_val(args, &mut i, flag)?.into()),
+            "--target-session-id" => target_session_id = Some(next_val(args, &mut i, flag)?.into()),
+            "--relates-to" => relates_to = Some(next_val(args, &mut i, flag)?.into()),
+            "--relation" => relation = Some(next_val(args, &mut i, flag)?.into()),
+            "--strategy" => strategy = next_val(args, &mut i, flag)?.into(),
+            "--scope" => scope = next_val(args, &mut i, flag)?.into(),
+            "--privacy" => privacy = Some(next_val(args, &mut i, flag)?.into()),
+            "--expected-updated-at" => expected_updated_at = Some(next_val(args, &mut i, flag)?.into()),
+            "--replaced-updated-at" => replaced_updated_at = Some(next_val(args, &mut i, flag)?.into()),
+            "--input-json" => {
+                let v = next_val(args, &mut i, flag)?;
+                let raw_bytes = if v == "-" {
+                    read_stdin_capped()?
+                } else {
+                    v.as_bytes().to_vec()
+                };
+                input_json = Some(serde_json::from_slice(&raw_bytes)?);
+            }
+            "--input" => input_path = Some(next_val(args, &mut i, flag)?.into()),
+            "--output-dir" => output_dir = Some(PathBuf::from(next_val(args, &mut i, flag)?)),
+            "--no-prune" => prune = false,
+            "--no-inherited" => include_inherited = false,
+            "--dry-run" => dry_run = true,
+            "--delete-branch" => delete_branch = true,
+            "--json" => {}
+            "--limit" => {
+                limit = next_val(args, &mut i, flag)?
+                    .parse::<usize>()
+                    .map_err(|_| RuntimeError::invalid("--limit must be numeric"))?;
+            }
+            "--offset" => {
+                offset = next_val(args, &mut i, flag)?
+                    .parse::<usize>()
+                    .map_err(|_| RuntimeError::invalid("--offset must be numeric"))?;
+            }
+            other if !other.starts_with('-') => {
+                if sub == "file-context" && path.is_none() {
+                    path = Some(other.into());
+                } else if matches!(sub, "branch-create" | "branch-delete") && name.is_none() {
+                    name = Some(other.into());
+                } else if sub == "branch-diff" && source_branch.is_none() {
+                    source_branch = Some(other.into());
+                } else {
+                    return Err(RuntimeError::invalid(format!(
+                        "Unexpected positional argument '{other}'"
+                    )));
+                }
+            }
+            other => return Err(RuntimeError::invalid(format!("Unknown omnigraph option: {other}"))),
+        }
+        i += 1;
+    }
+
+    if sub == "schema" {
+        if let Some(dir) = output_dir {
+            omnigraph::schema::write_cluster_bundle(&dir, omnigraph::schema::HARNESS_GRAPH_ID)?;
+            return print_json(&serde_json::json!({
+                "ok": true,
+                "output_dir": dir,
+                "graph_id": omnigraph::schema::HARNESS_GRAPH_ID,
+            }));
+        }
+        return print_json(&serde_json::json!({
+            "graph_id": omnigraph::schema::HARNESS_GRAPH_ID,
+            "canonical_branch": omnigraph::schema::CANONICAL_KNOWLEDGE_BRANCH,
+            "om_version": omnigraph::schema::OMNIGRAPH_VERSION,
+            "pg_schema": omnigraph::schema::HARNESS_CONTEXT_PG,
+            "stored_queries": omnigraph::schema::STORED_QUERIES.iter().map(|q| serde_json::json!({
+                "name": q.name,
+                "description": q.description,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+
+    let ctx = build_context(root.as_deref(), project.as_deref(), None, None, false)?;
+    let pid = default_project_id(&ctx, project_id.as_deref());
+    let eng = OmnigraphEngine::open(&ctx)?;
+
+    let out = match sub {
+        "status" => eng.status(&pid)?,
+        "sync-canonical" => {
+            if let Some(val) = input_json {
+                let items = val
+                    .get("items")
+                    .or(Some(&val))
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| RuntimeError::invalid("sync-canonical JSON must provide `items` array"))?;
+                let prune_layers = if prune {
+                    vec!["project-brain".into(), "memory-bank".into()]
+                } else {
+                    Vec::new()
+                };
+                eng.sync_canonical_items(&pid, items, &prune_layers)?
+            } else {
+                eng.sync_canonical_workspace(&ctx, &pid, prune)?
+            }
+        }
+        "file-context" => {
+            let p = path
+                .as_deref()
+                .ok_or_else(|| RuntimeError::invalid("omnigraph file-context requires --path"))?;
+            let mut res = eng.file_context(&pid, p, branch.as_deref())?;
+            let cw = omnigraph::bridge::contradiction_warnings(&res["contradictions"], &res["atoms"]);
+            res["contradiction_warnings"] = Value::Array(cw);
+            res
+        }
+        "atoms" => eng.atoms_query(&pid, branch.as_deref(), kind.as_deref(), query.as_deref(), limit, offset)?,
+        "publish" => {
+            let mut body = input_json.unwrap_or_else(|| serde_json::json!({}));
+            if let Some(obj) = body.as_object_mut() {
+                obj.entry("project_id").or_insert_with(|| Value::String(pid.clone()));
+                if let Some(b) = branch { obj.insert("branch".into(), Value::String(b)); }
+                if let Some(id) = atom_id { obj.insert("atom_id".into(), Value::String(id)); }
+                if let Some(k) = kind { obj.insert("kind".into(), Value::String(k)); }
+                if let Some(t) = title { obj.insert("title".into(), Value::String(t)); }
+                if let Some(s) = summary { obj.insert("summary".into(), Value::String(s)); }
+                if let Some(b) = body_text { obj.insert("body".into(), Value::String(b)); }
+                if !files.is_empty() { obj.insert("files".into(), serde_json::json!(files)); }
+                if let Some(sid) = session_id { obj.insert("session_id".into(), Value::String(sid)); }
+                if let Some(rel_t) = relates_to {
+                    obj.insert("relates_to".into(), serde_json::json!({
+                        "target_id": rel_t,
+                        "relation": relation.unwrap_or_else(|| "supports".into()),
+                    }));
+                }
+            }
+            eng.publish_atom(&body)?
+        }
+        "share" => {
+            let sid = target_session_id
+                .ok_or_else(|| RuntimeError::invalid("omnigraph share requires --target-session-id"))?;
+            eng.share_into_session(&serde_json::json!({
+                "project_id": pid,
+                "branch": branch.unwrap_or_else(|| "main".into()),
+                "target_session_id": sid,
+                "atom_ids": atom_ids,
+            }))?
+        }
+        "branch-create" => {
+            let n = name.ok_or_else(|| RuntimeError::invalid("branch-create requires --name"))?;
+            eng.create_branch(&n, from_branch.as_deref())?
+        }
+        "branch-delete" => {
+            let n = name.ok_or_else(|| RuntimeError::invalid("branch-delete requires --name"))?;
+            eng.delete_branch(&n)?
+        }
+        "branch-diff" => {
+            let src = source_branch
+                .ok_or_else(|| RuntimeError::invalid("branch-diff requires --source"))?;
+            eng.branch_diff(&pid, &src, target_branch.as_deref())?
+        }
+        "merge-keep" => {
+            if let (Some(aid), Some(from), Some(to)) =
+                (atom_id.as_deref(), from_branch.as_deref(), to_branch.as_deref())
+            {
+                eng.keep_atom(
+                    aid,
+                    from,
+                    to,
+                    expected_updated_at.as_deref(),
+                    replaced_updated_at.as_deref(),
+                )?
+            } else {
+                let src = source_branch
+                    .ok_or_else(|| RuntimeError::invalid("merge-keep requires --source (or --atom-id --from --to)"))?;
+                eng.merge_keep(&omnigraph::MergeKeepOptions {
+                    project_id: &pid,
+                    source: &src,
+                    target: target_branch.as_deref(),
+                    strategy: &strategy,
+                    atom_ids: &atom_ids,
+                    dry_run,
+                    delete_branch,
+                })?
+            }
+        }
+        "export-ndjson" => eng.export_ndjson(&pid, branch.as_deref(), &scope, include_inherited)?,
+        "import-ndjson" => {
+            let raw = match input_path.as_deref() {
+                Some("-") | None => String::from_utf8(read_stdin_capped()?)
+                    .map_err(|_| RuntimeError::invalid("NDJSON input is not valid UTF-8"))?,
+                Some(file) => std::fs::read_to_string(file)?,
+            };
+            eng.import_ndjson(&pid, branch.as_deref(), &raw)?
+        }
+        "promote-atom" => {
+            let mut body = input_json.unwrap_or_else(|| {
+                serde_json::json!({
+                    "atom": {
+                        "atom_id": atom_id.unwrap_or_default(),
+                        "title": title.unwrap_or_default(),
+                        "body": body_text.clone().unwrap_or_default(),
+                        "files": files.clone(),
+                    },
+                    "files": files,
+                    "kind": kind,
+                    "privacy": privacy,
+                })
+            });
+            if let Some(obj) = body.as_object_mut() {
+                if let Some(k) = kind {
+                    obj.insert("kind".into(), Value::String(k));
+                }
+                if let Some(p) = privacy {
+                    obj.insert("privacy".into(), Value::String(p));
+                }
+            }
+            omnigraph::bridge::promote_atom(&ctx, &body)?
+        }
+        _ => unreachable!(),
+    };
+    print_json(&out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_omnigraph_memory_links_and_promote_flags_dispatch_cleanly() {
+        let root = std::env::temp_dir().join(format!(
+            "cg-cli-test-{}",
+            context_graph_core::domain::uuid4()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("project-brain/schemas")).unwrap();
+        std::fs::create_dir_all(root.join("memory-bank/chunks")).unwrap();
+        std::fs::write(
+            root.join("src/Billing.php"),
+            "<?php\nclass Billing { public function charge(): void {} }\n",
+        )
+        .unwrap();
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../context-graph-core/schemas/dynamic-record.schema.json"),
+            root.join("project-brain/schemas/dynamic-record.schema.json"),
+        )
+        .unwrap();
+
+        let r_s = root.to_string_lossy().to_string();
+        assert_eq!(
+            dispatch(&[
+                "omnigraph".into(),
+                "publish".into(),
+                "--root".into(),
+                r_s.clone(),
+                "--atom-id".into(),
+                "atom-b1".into(),
+                "--kind".into(),
+                "decision".into(),
+                "--title".into(),
+                "Charge rule".into(),
+                "--body".into(),
+                "Call Billing::charge idempotently.".into(),
+                "--file".into(),
+                "src/Billing.php".into(),
+            ])
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            dispatch(&[
+                "omnigraph".into(),
+                "file-context".into(),
+                "--root".into(),
+                r_s.clone(),
+                "--path".into(),
+                "src/Billing.php".into(),
+            ])
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            dispatch(&[
+                "memory-links".into(),
+                "--root".into(),
+                r_s,
+                "--path".into(),
+                "src/Billing.php".into(),
+            ])
+            .unwrap(),
+            0
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -12,9 +12,10 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub const TARGET_BUDGET: usize = 8000;
@@ -124,23 +125,240 @@ fn admit_for(
     let (_, missing) = source_changes(&context.roots, &document.source_fingerprints)?;
     Ok((!missing.is_empty()).then(|| "source-missing".into()))
 }
+const MAP_DRIFT_RACY_NS: i128 = 2_000_000_000;
+const MAP_DRIFT_CACHE_CAP: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MapGitFileStamp {
+    exists: bool,
+    len: u64,
+    mtime_ns: i128,
+    ctime_ns: i128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MapDriftGitStamp {
+    head: MapGitFileStamp,
+    head_bytes: Vec<u8>,
+    ref_target: Option<MapGitFileStamp>,
+    packed_refs: MapGitFileStamp,
+    reftable: MapGitFileStamp,
+    index: MapGitFileStamp,
+}
+
+#[derive(Clone, Debug)]
+struct CachedMapDrift {
+    stamp: MapDriftGitStamp,
+    drift: Option<u64>,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct MapDriftCache {
+    seq: u64,
+    entries: HashMap<(PathBuf, String, Option<String>), CachedMapDrift>,
+}
+
+fn map_drift_cache() -> &'static Mutex<MapDriftCache> {
+    static CACHE: OnceLock<Mutex<MapDriftCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(MapDriftCache::default()))
+}
+
+#[cfg(test)]
+fn map_drift_git_calls() -> &'static std::sync::atomic::AtomicUsize {
+    static CALLS: OnceLock<std::sync::atomic::AtomicUsize> = OnceLock::new();
+    CALLS.get_or_init(|| std::sync::atomic::AtomicUsize::new(0))
+}
+
+fn map_drift_now_ns() -> i128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i128::try_from(d.as_nanos()).ok())
+        .unwrap_or(0)
+}
+
+fn stat_git_file_settled(
+    path: &Path,
+    now_ns: i128,
+    require_exists: bool,
+) -> Option<MapGitFileStamp> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && !require_exists => {
+            return Some(MapGitFileStamp {
+                exists: false,
+                len: 0,
+                mtime_ns: 0,
+                ctime_ns: 0,
+            });
+        }
+        Err(_) => return None,
+    };
+    if fs::linked(&meta) || !meta.is_file() {
+        return None;
+    }
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .and_then(|d| i128::try_from(d.as_nanos()).ok())?;
+    #[cfg(unix)]
+    let ctime_ns = {
+        use std::os::unix::fs::MetadataExt;
+        i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec())
+    };
+    #[cfg(not(unix))]
+    let ctime_ns = mtime_ns;
+    if now_ns <= MAP_DRIFT_RACY_NS
+        || mtime_ns <= 0
+        || mtime_ns > now_ns - MAP_DRIFT_RACY_NS
+        || ctime_ns > now_ns - MAP_DRIFT_RACY_NS
+    {
+        return None;
+    }
+    Some(MapGitFileStamp {
+        exists: true,
+        len: meta.len(),
+        mtime_ns,
+        ctime_ns,
+    })
+}
+
+fn capture_map_drift_stamp(project: &Path, now_ns: i128) -> Option<(PathBuf, MapDriftGitStamp)> {
+    let canonical = fs::canonicalize(project).ok()?;
+    let snap = crate::git::branch_snapshot(&canonical)?;
+    let admin = snap.admin;
+    let common_admin = {
+        let commondir_path = admin.join("commondir");
+        match std::fs::symlink_metadata(&commondir_path) {
+            Ok(meta) if !fs::linked(&meta) && meta.is_file() && meta.len() <= 4096 => {
+                let raw = std::fs::read_to_string(&commondir_path).ok()?;
+                let rel = raw.trim();
+                if rel.is_empty() {
+                    admin.clone()
+                } else {
+                    let candidate = Path::new(rel);
+                    fs::canonicalize(if candidate.is_absolute() {
+                        candidate.to_path_buf()
+                    } else {
+                        admin.join(candidate)
+                    })
+                    .ok()?
+                }
+            }
+            Ok(_) => return None,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => admin.clone(),
+            Err(_) => return None,
+        }
+    };
+    let head_path = admin.join("HEAD");
+    let head = stat_git_file_settled(&head_path, now_ns, true)?;
+    if head.len > 1024 {
+        return None;
+    }
+    let head_bytes = std::fs::read(&head_path).ok()?;
+    let head_text = std::str::from_utf8(&head_bytes).ok()?.trim();
+    let ref_target = if let Some(target_ref) = head_text.strip_prefix("ref: ").map(str::trim) {
+        if target_ref.is_empty()
+            || target_ref.starts_with('/')
+            || target_ref.contains('\\')
+            || target_ref
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return None;
+        }
+        let local_ref = admin.join(target_ref);
+        if std::fs::symlink_metadata(&local_ref).is_ok() {
+            Some(stat_git_file_settled(&local_ref, now_ns, true)?)
+        } else {
+            let common_ref = common_admin.join(target_ref);
+            Some(stat_git_file_settled(&common_ref, now_ns, false)?)
+        }
+    } else {
+        None
+    };
+    let packed_refs = stat_git_file_settled(&common_admin.join("packed-refs"), now_ns, false)?;
+    let reftable =
+        stat_git_file_settled(&common_admin.join("reftable/tables.list"), now_ns, false)?;
+    let index = stat_git_file_settled(&admin.join("index"), now_ns, false)?;
+    Some((
+        canonical,
+        MapDriftGitStamp {
+            head,
+            head_bytes,
+            ref_target,
+            packed_refs,
+            reftable,
+            index,
+        },
+    ))
+}
+
+fn map_commit_re() -> Result<&'static regex::Regex> {
+    static PATTERN: OnceLock<std::result::Result<regex::Regex, regex::Error>> = OnceLock::new();
+    PATTERN
+        .get_or_init(|| regex::Regex::new(r"(?m)^mapped_commit:\s*([0-9a-fA-F]{7,40})\s*$"))
+        .as_ref()
+        .map_err(|_| RuntimeError::invalid("Invalid map expression"))
+}
+
+fn map_scope_re() -> Result<&'static regex::Regex> {
+    static PATTERN: OnceLock<std::result::Result<regex::Regex, regex::Error>> = OnceLock::new();
+    PATTERN
+        .get_or_init(|| regex::Regex::new(r"(?m)^mapped_scope:\s*(\S+)\s*$"))
+        .as_ref()
+        .map_err(|_| RuntimeError::invalid("Invalid map scope expression"))
+}
+
 pub(crate) fn map_drift(context: &RuntimeContext, text: &str) -> Result<Option<u64>> {
-    let commit = regex::Regex::new(r"(?m)^mapped_commit:\s*([0-9a-fA-F]{7,40})\s*$")
-        .map_err(|_| RuntimeError::invalid("Invalid map expression"))?;
+    map_drift_with_now(context, text, map_drift_now_ns())
+}
+
+pub(crate) fn map_drift_with_now(
+    context: &RuntimeContext,
+    text: &str,
+    now_ns: i128,
+) -> Result<Option<u64>> {
+    let commit = map_commit_re()?;
     let Some(recorded) = commit.captures(text).and_then(|captures| captures.get(1)) else {
         return Ok(None);
     };
-    let mut arguments = crate::git::strings(&[
-        "rev-list",
-        "--count",
-        &format!("{}..HEAD", recorded.as_str()),
-    ]);
-    let scope = regex::Regex::new(r"(?m)^mapped_scope:\s*(\S+)\s*$")
-        .map_err(|_| RuntimeError::invalid("Invalid map scope expression"))?;
-    if let Some(scope) = scope.captures(text).and_then(|captures| captures.get(1)) {
-        arguments.push("--".into());
-        arguments.push(scope.as_str().into());
+    let recorded_str = recorded.as_str();
+    let scope_re = map_scope_re()?;
+    let scope_str = scope_re
+        .captures(text)
+        .and_then(|captures| captures.get(1))
+        .map(|m| m.as_str());
+
+    let stamp_info = capture_map_drift_stamp(&context.roots.project, now_ns);
+    if let Some((ref canonical, ref stamp)) = stamp_info
+        && let Ok(mut cache) = map_drift_cache().lock()
+    {
+        cache.seq = cache.seq.saturating_add(1);
+        let use_seq = cache.seq;
+        let key = (
+            canonical.clone(),
+            recorded_str.to_owned(),
+            scope_str.map(str::to_owned),
+        );
+        if let Some(hit) = cache.entries.get_mut(&key)
+            && hit.stamp == *stamp
+        {
+            hit.last_used = use_seq;
+            return Ok(hit.drift);
+        }
     }
+
+    let mut arguments =
+        crate::git::strings(&["rev-list", "--count", &format!("{recorded_str}..HEAD")]);
+    if let Some(scope) = scope_str {
+        arguments.push("--".into());
+        arguments.push(scope.into());
+    }
+    #[cfg(test)]
+    map_drift_git_calls().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let output = crate::git::run(
         &context.roots.project,
         &arguments,
@@ -148,12 +366,46 @@ pub(crate) fn map_drift(context: &RuntimeContext, text: &str) -> Result<Option<u
         Duration::from_secs(5),
         16384,
     )?;
-    if output.code != 0 {
-        return Ok(None);
+    let drift = if output.code != 0 {
+        None
+    } else {
+        std::str::from_utf8(&output.stdout)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+    };
+    if let Some((canonical, stamp)) = capture_map_drift_stamp(&context.roots.project, now_ns)
+        && stamp_info
+            .as_ref()
+            .is_some_and(|(_, before)| *before == stamp)
+        && let Ok(mut cache) = map_drift_cache().lock()
+    {
+        cache.seq = cache.seq.saturating_add(1);
+        let use_seq = cache.seq;
+        let key = (
+            canonical,
+            recorded_str.to_owned(),
+            scope_str.map(str::to_owned),
+        );
+        if cache.entries.len() >= MAP_DRIFT_CACHE_CAP
+            && !cache.entries.contains_key(&key)
+            && let Some(evict) = cache
+                .entries
+                .iter()
+                .min_by_key(|(_, v)| v.last_used)
+                .map(|(k, _)| k.clone())
+        {
+            cache.entries.remove(&evict);
+        }
+        cache.entries.insert(
+            key,
+            CachedMapDrift {
+                stamp,
+                drift,
+                last_used: use_seq,
+            },
+        );
     }
-    Ok(std::str::from_utf8(&output.stdout)
-        .ok()
-        .and_then(|text| text.trim().parse().ok()))
+    Ok(drift)
 }
 pub(crate) fn filter_observed(
     context: &RuntimeContext,
@@ -847,7 +1099,7 @@ fn twin_notices(store: &Store, external_id: &str, served: &str) -> Result<Vec<St
         format!(
             // The installed CLI's name is longer than the retired one's: the
             // whole command still fits the 160 characters a warning keeps.
-            "One task per branch: memory-bank/bin/infra-engine memory brain-update --record-id {cancel} --revision auto --transition cancelled"
+            "One task per branch: context-graph-engine memory brain-update --record-id {cancel} --revision auto --transition cancelled"
         ),
     ])
 }
@@ -939,10 +1191,13 @@ fn retrieve_inner(
         // The record of the bound task was removed with uncommitted files: the
         // turn is served as for a task not recorded yet, knowledge included,
         // and says so.
+        // One read of the active records serves the binding check, the
+        // served task and its lookup.
+        let inventory = brain.inventory(false)?;
         if request.allow_unprovisioned
             && let Some(binding) = store.binding(id)?
             && brain
-                .find(&binding.task_uuid, Some("task"), false)
+                .find_in(&inventory, &binding.task_uuid, Some("task"))
                 .is_err_and(|error| error.kind == ErrorKind::NotFound)
         {
             binding_notices.push(format!(
@@ -950,7 +1205,7 @@ fn retrieve_inner(
                 binding.task_uuid
             ));
         }
-        let served = match crate::checkpoint::served_uuid(Some(store), context, id) {
+        let served = match crate::checkpoint::served_uuid_in(Some(store), &brain, &inventory, id) {
             Ok(served) => served.unwrap_or_else(|| id.clone()),
             Err(error) if request.allow_unprovisioned && unreadable_record(&error) => {
                 binding_notices.push(unreadable_notice(&error));
@@ -962,7 +1217,7 @@ fn retrieve_inner(
         let found = if unreadable {
             None
         } else {
-            Some(brain.find(&served, Some("task"), false))
+            Some(brain.find_in(&inventory, &served, Some("task")))
         };
         match found {
             None => {}
@@ -1037,15 +1292,23 @@ fn retrieve_inner(
         capsule.0["categories"] = json!({});
         capsule.0["token_estimates"] =
             json!({"procedural":0,"semantic":0,"episodic":0,"local_episodes":0,"total":0});
-        return capsule::pack(capsule, request.delivery_profile);
+        return capsule::pack_with_options(
+            capsule,
+            request.delivery_profile,
+            capsule::pack_deduplicated(&config),
+        );
     }
     warnings.extend(binding_notices);
-    let (mut candidates, diagnostics) = query::rank_candidates_observed(
-        &store.conn,
+    let (mut candidates, diagnostics) = cached_or_rank_candidates(
+        store,
         &query,
         request.limit.saturating_mul(10).max(20),
         scope.as_deref(),
-        Some(&mut trace),
+        request.task_id.as_deref().unwrap_or(""),
+        &profile,
+        task.as_ref(),
+        &request.trace_paths,
+        &mut trace,
     )?;
     let mut graph_anchor_count = 0usize;
     let mut graph_candidate_count = 0usize;
@@ -1571,7 +1834,11 @@ fn retrieve_inner(
     trace.boundary("pack_input", &selected);
     capsule.1 = prepared;
     let pack_started = Instant::now();
-    capsule = capsule::pack(capsule, request.delivery_profile)?;
+    capsule = capsule::pack_with_options(
+        capsule,
+        request.delivery_profile,
+        capsule::pack_deduplicated(&config),
+    )?;
     pack_seconds += pack_started.elapsed().as_secs_f64();
     let shown = capsule.shown_paths();
     let shown_episodes = capsule.shown_episodes();
@@ -1686,7 +1953,11 @@ fn retrieve_inner(
     }
     capsule::synchronize(&mut capsule);
     let pack_started = Instant::now();
-    capsule = capsule::pack(capsule, request.delivery_profile)?;
+    capsule = capsule::pack_with_options(
+        capsule,
+        request.delivery_profile,
+        capsule::pack_deduplicated(&config),
+    )?;
     pack_seconds += pack_started.elapsed().as_secs_f64();
     let shown = capsule.shown_paths();
     let shown_episodes = capsule.shown_episodes();
@@ -2175,4 +2446,405 @@ fn prune_manifests(directory: &Path, retention: usize) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static QUERY_PLAN_CACHE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static QUERY_PLAN_CACHE_MISSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+fn query_plan_cache_hits() -> usize {
+    QUERY_PLAN_CACHE_HITS.with(|cell| cell.get())
+}
+#[cfg(test)]
+fn query_plan_cache_misses() -> usize {
+    QUERY_PLAN_CACHE_MISSES.with(|cell| cell.get())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keep query-plan cache lookup dimensions explicit at the FTS5 boundary."
+)]
+fn cached_or_rank_candidates(
+    store: &mut Store,
+    query: &str,
+    limit: usize,
+    scope: Option<&[String]>,
+    task_id: &str,
+    capsule_profile: &str,
+    task: Option<&Value>,
+    trace_paths: &[String],
+    trace: &mut crate::observability::Trace,
+) -> Result<(Vec<Candidate>, Diagnostics)> {
+    let plan_key = crate::storage::index_generation(&store.conn)
+        .ok()
+        .map(|index_generation| {
+            let scope_digest = scope
+                .map(|paths| {
+                    serde_json::to_vec(paths)
+                        .map(|bytes| query::sha256(&bytes))
+                        .unwrap_or_default()
+                })
+                .unwrap_or_else(|| "all".into());
+            let trace_paths_digest = if trace_paths.is_empty() {
+                "none".into()
+            } else {
+                serde_json::to_vec(trace_paths)
+                    .map(|bytes| query::sha256(&bytes))
+                    .unwrap_or_default()
+            };
+            let trace_policy_digest = serde_json::to_vec(&(
+                &trace.config.value["allowed_privacy"],
+                &trace.config.value["owners"],
+            ))
+            .map(|bytes| query::sha256(&bytes))
+            .unwrap_or_default();
+            let task_rev = task
+                .and_then(|record| record["revision"].as_u64())
+                .unwrap_or(0);
+            let task_updated = task
+                .and_then(|record| record["updated_at"].as_str())
+                .unwrap_or("");
+            let today = crate::domain::clock::today().to_string();
+            crate::storage::QueryPlanKey {
+                word_tokens: query::word_tokens(query),
+                task_id: task_id.to_owned(),
+                capsule_profile: capsule_profile.to_owned(),
+                index_generation,
+                working_rev: format!(
+                    "{task_rev}:{task_updated}:{limit}:{scope_digest}:{trace_paths_digest}:{trace_policy_digest}:{today}"
+                ),
+            }
+        });
+
+    if let Some(key) = &plan_key
+        && let Some(hit) = crate::storage::QueryPlanCache::lookup(&store.conn, key)
+    {
+        #[cfg(test)]
+        QUERY_PLAN_CACHE_HITS.with(|cell| cell.set(cell.get() + 1));
+        trace.evidence_terms = hit.evidence_terms;
+        trace.required_terms = hit.required_terms;
+        if let Some(events) = hit.funnel_events {
+            trace.funnel["events"] = events;
+        }
+        if let Some(records) = hit.trace_records {
+            trace.records = records;
+            trace.order = hit.trace_order;
+            trace.truncated = hit.trace_truncated;
+        }
+        return Ok((hit.candidates, hit.diagnostics));
+    }
+
+    #[cfg(test)]
+    QUERY_PLAN_CACHE_MISSES.with(|cell| cell.set(cell.get() + 1));
+
+    let (candidates, diagnostics) =
+        query::rank_candidates_observed(&store.conn, query, limit, scope, Some(trace))?;
+    if let Some(key) = &plan_key {
+        crate::storage::QueryPlanCache::store(store, key, &candidates, &diagnostics, Some(trace));
+    }
+    Ok((candidates, diagnostics))
+}
+
+#[cfg(test)]
+mod query_plan_cache_tests {
+    use super::*;
+    use crate::domain::uuid4;
+
+    struct OwnedDir(PathBuf);
+    impl Drop for OwnedDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn retrieval_hits_query_plan_cache_and_falls_back_when_index_or_cache_changes() {
+        let root = std::env::temp_dir().join(format!("infra-qpc-ret-{}", uuid4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _dir = OwnedDir(root.clone());
+        let mut store = Store::open(
+            root.join("context.db"),
+            crate::storage::OpenOptions::refresh(None),
+        )
+        .unwrap();
+        store
+            .transaction(|conn| {
+                conn.execute(
+                    "INSERT INTO documents(path,layer,kind,title,summary,content) VALUES(?1,'semantic','finding',?2,?3,?4)",
+                    rusqlite::params![
+                        "memory-bank/chunks/MEM-20260101-abcd1234-invoice.md",
+                        "Invoice numbering rules",
+                        "Invoices reset yearly per tenant",
+                        "Invoices reset yearly per tenant in InvoiceRepository"
+                    ],
+                )?;
+                conn.execute(
+                    "INSERT INTO document_metadata(path,category,privacy,owner,authority,lifecycle,source_hash,record_id,conflicts,source_fingerprints,updated_at,confidence,attestation) VALUES(?1,'durable','team','*','verified','active',?2,NULL,'[]','[]',?3,1.0,'')",
+                    rusqlite::params![
+                        "memory-bank/chunks/MEM-20260101-abcd1234-invoice.md",
+                        "1".repeat(64),
+                        "2026-01-01T00:00:00Z"
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let roots = crate::Roots::discover(&root, &root).unwrap();
+        let config = RuntimeConfig::load(&roots).unwrap();
+        let mut t1 = crate::observability::Trace::new(config.clone(), &[]).unwrap();
+        let before_misses = query_plan_cache_misses();
+        let before_hits = query_plan_cache_hits();
+
+        let (first, d1) = cached_or_rank_candidates(
+            &mut store,
+            "invoice numbering",
+            30,
+            None,
+            "TASK-1",
+            "full",
+            None,
+            &[],
+            &mut t1,
+        )
+        .unwrap();
+        assert_eq!(query_plan_cache_misses(), before_misses + 1);
+        assert_eq!(query_plan_cache_hits(), before_hits);
+        assert_eq!(first.len(), 1);
+
+        let mut t2 = crate::observability::Trace::new(config.clone(), &[]).unwrap();
+        let (second, d2) = cached_or_rank_candidates(
+            &mut store,
+            "invoice numbering",
+            30,
+            None,
+            "TASK-1",
+            "full",
+            None,
+            &[],
+            &mut t2,
+        )
+        .unwrap();
+        assert_eq!(query_plan_cache_hits(), before_hits + 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].document.path, first[0].document.path);
+        assert_eq!(second[0].snippet, first[0].snippet);
+        assert_eq!(d2.coverage, d1.coverage);
+        assert_eq!(t2.funnel["events"], t1.funnel["events"]);
+
+        // Corrupt cached JSON -> automatic live FTS5 fallback keeps retrieval working.
+        store
+            .transaction(|conn| {
+                conn.execute("UPDATE query_plan_cache SET payload='{corrupt'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let mut t3 = crate::observability::Trace::new(config.clone(), &[]).unwrap();
+        let (third, _) = cached_or_rank_candidates(
+            &mut store,
+            "invoice numbering",
+            30,
+            None,
+            "TASK-1",
+            "full",
+            None,
+            &[],
+            &mut t3,
+        )
+        .unwrap();
+        assert_eq!(query_plan_cache_misses(), before_misses + 2);
+        assert_eq!(third.len(), 1);
+
+        // Changing capsule_profile or index_generation invalidates cache cleanly.
+        store
+            .transaction(|conn| {
+                conn.execute(
+                    "UPDATE document_metadata SET source_hash=?1 WHERE path=?2",
+                    rusqlite::params![
+                        "2".repeat(64),
+                        "memory-bank/chunks/MEM-20260101-abcd1234-invoice.md"
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let mut t4 = crate::observability::Trace::new(config.clone(), &[]).unwrap();
+        let (fourth, _) = cached_or_rank_candidates(
+            &mut store,
+            "invoice numbering",
+            30,
+            None,
+            "TASK-1",
+            "full",
+            None,
+            &[],
+            &mut t4,
+        )
+        .unwrap();
+        assert_eq!(query_plan_cache_misses(), before_misses + 3);
+        assert_eq!(fourth.len(), 1);
+
+        // Trace-scoped calls hit the cache when trace_paths match and miss when they differ.
+        let watched = vec!["memory-bank/chunks/MEM-20260101-abcd1234-invoice.md".to_string()];
+        let mut tw1 = crate::observability::Trace::new(config.clone(), &watched).unwrap();
+        let _ = tw1.watch(&store.conn);
+        let hits_before_trace = query_plan_cache_hits();
+        let misses_before_trace = query_plan_cache_misses();
+        let (trace_first, _) = cached_or_rank_candidates(
+            &mut store,
+            "invoice numbering",
+            30,
+            None,
+            "TASK-1",
+            "full",
+            None,
+            &watched,
+            &mut tw1,
+        )
+        .unwrap();
+        assert_eq!(query_plan_cache_misses(), misses_before_trace + 1);
+        assert_eq!(trace_first.len(), 1);
+
+        let mut tw2 = crate::observability::Trace::new(config.clone(), &watched).unwrap();
+        let _ = tw2.watch(&store.conn);
+        let (trace_second, _) = cached_or_rank_candidates(
+            &mut store,
+            "invoice numbering",
+            30,
+            None,
+            "TASK-1",
+            "full",
+            None,
+            &watched,
+            &mut tw2,
+        )
+        .unwrap();
+        assert_eq!(query_plan_cache_hits(), hits_before_trace + 1);
+        assert_eq!(trace_second.len(), 1);
+        assert_eq!(tw2.records, tw1.records);
+        assert_eq!(tw2.order, tw1.order);
+        assert_eq!(tw2.funnel["events"], tw1.funnel["events"]);
+
+        let other_watched = vec!["docs/other.md".to_string()];
+        let mut tw3 = crate::observability::Trace::new(config, &other_watched).unwrap();
+        let _ = tw3.watch(&store.conn);
+        let _ = cached_or_rank_candidates(
+            &mut store,
+            "invoice numbering",
+            30,
+            None,
+            "TASK-1",
+            "full",
+            None,
+            &other_watched,
+            &mut tw3,
+        )
+        .unwrap();
+        assert_eq!(query_plan_cache_misses(), misses_before_trace + 2);
+        assert!(tw3.records.contains_key("docs/other.md"));
+        assert_eq!(tw3.records["docs/other.md"]["state"], "unavailable");
+    }
+
+    #[test]
+    fn map_drift_caches_settled_head_and_index_and_invalidates_on_racy_or_commit_changes() {
+        let dir = std::env::temp_dir().join(format!("infra-core-map-drift-{}", uuid4()));
+        std::fs::create_dir_all(dir.join("project-brain/config")).unwrap();
+        std::fs::create_dir_all(dir.join("memory-bank")).unwrap();
+        std::fs::write(dir.join("project-brain/config/runtime.json"), "{}").unwrap();
+        std::fs::write(dir.join("README.md"), "v1\n").unwrap();
+
+        let run_git = |args: &[&str]| {
+            let out = crate::git::run(
+                &dir,
+                &crate::git::strings(args),
+                None,
+                Duration::from_secs(5),
+                16384,
+            )
+            .unwrap();
+            assert_eq!(out.code, 0, "git {:?} failed", args);
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run_git(&["init", "-b", "main"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test"]);
+        run_git(&["add", "README.md"]);
+        run_git(&["commit", "-m", "init"]);
+        let base_commit = run_git(&["rev-parse", "HEAD"]);
+        std::fs::write(dir.join("README.md"), "v2\n").unwrap();
+        run_git(&["add", "README.md"]);
+        run_git(&["commit", "-m", "second"]);
+
+        let ctx = RuntimeContext::new(crate::Roots::installed(&dir).unwrap(), "agent", "governed")
+            .unwrap();
+        let text = format!("mapped_commit: {base_commit}\nmapped_scope: README.md\n");
+
+        // Capture settled timestamp beyond MAP_DRIFT_RACY_NS.
+        let (_, stamp) = capture_map_drift_stamp(&dir, i128::MAX / 2).expect("git stamp");
+        let max_mtime = [
+            stamp.head.mtime_ns,
+            stamp.ref_target.as_ref().map_or(0, |s| s.mtime_ns),
+            stamp.packed_refs.mtime_ns,
+            stamp.reftable.mtime_ns,
+            stamp.index.mtime_ns,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+
+        let before = map_drift_git_calls().load(std::sync::atomic::Ordering::Relaxed);
+        // Inside RACY_NS window -> never populates or hits cache.
+        let racy_now = max_mtime + MAP_DRIFT_RACY_NS - 1;
+        assert_eq!(map_drift_with_now(&ctx, &text, racy_now).unwrap(), Some(1));
+        assert_eq!(map_drift_with_now(&ctx, &text, racy_now).unwrap(), Some(1));
+        assert_eq!(
+            map_drift_git_calls().load(std::sync::atomic::Ordering::Relaxed),
+            before + 2
+        );
+
+        // Outside RACY_NS window -> 1st call runs git, 2nd call hits cache (0 git calls).
+        let settled_now = max_mtime + MAP_DRIFT_RACY_NS + 10;
+        assert_eq!(
+            map_drift_with_now(&ctx, &text, settled_now).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            map_drift_git_calls().load(std::sync::atomic::Ordering::Relaxed),
+            before + 3
+        );
+        assert_eq!(
+            map_drift_with_now(&ctx, &text, settled_now + 5).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            map_drift_git_calls().load(std::sync::atomic::Ordering::Relaxed),
+            before + 3
+        );
+
+        // New commit updates ref + index -> invalidates and returns updated drift 2.
+        std::fs::write(dir.join("README.md"), "v3\n").unwrap();
+        run_git(&["add", "README.md"]);
+        run_git(&["commit", "-m", "third"]);
+        let (_, stamp2) = capture_map_drift_stamp(&dir, i128::MAX / 2).expect("stamp2");
+        let max2 = [
+            stamp2.head.mtime_ns,
+            stamp2.ref_target.as_ref().map_or(0, |s| s.mtime_ns),
+            stamp2.index.mtime_ns,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+        assert_eq!(
+            map_drift_with_now(&ctx, &text, max2 + MAP_DRIFT_RACY_NS + 10).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            map_drift_git_calls().load(std::sync::atomic::Ordering::Relaxed),
+            before + 4
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -78,3 +78,5 @@ pub mod source_policy;
 pub mod source_hints;
 pub mod graph;
 pub mod bundle;
+pub mod snapshot;
+pub mod omnigraph;

@@ -7,6 +7,7 @@ use crate::{
     graph::{self, Direction, GraphQuery},
     handoff::{HandoffService, SaveHandoff},
     index,
+    omnigraph::{self, OmnigraphEngine},
     results::{self, RecordResult, ResultService, Revision},
     retrieval::RetrievalRequest,
     serving::TaskService,
@@ -22,6 +23,21 @@ use std::{
 pub const VERSION: &str = "2025-06-18";
 pub const MAX_MESSAGE: usize = 128 * 1024;
 pub const MAX_DEPTH: usize = 64;
+
+fn is_plugin_marker_root(dir: &Path) -> bool {
+    dir.join(".codex-plugin/plugin.json").is_file()
+        || dir.join(".claude-plugin/plugin.json").is_file()
+        || (dir.join(".mcp.json").is_file() && dir.join("bin/context-graph-engine").is_file())
+}
+
+pub fn is_plugin_dir(dir: &Path) -> bool {
+    dir.ancestors().any(is_plugin_marker_root)
+}
+
+pub fn is_marketplace_dir(dir: &Path) -> bool {
+    dir.join(".claude-plugin/marketplace.json").is_file()
+        || dir.join(".agents/plugins/marketplace.json").is_file()
+}
 
 pub struct McpServer {
     pub context: RuntimeContext,
@@ -65,8 +81,11 @@ impl McpServer {
     }
 
     fn is_plugin_dir(dir: &Path) -> bool {
-        dir.join(".codex-plugin/plugin.json").is_file()
-            || dir.join(".claude-plugin/plugin.json").is_file()
+        is_plugin_dir(dir)
+    }
+
+    fn is_marketplace_dir(dir: &Path) -> bool {
+        is_marketplace_dir(dir)
     }
 
     fn resolve_context(&self, tool_name: &str, input: &Value) -> Result<RuntimeContext> {
@@ -82,8 +101,9 @@ impl McpServer {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty());
+        let cwd_is_plugin = Self::is_plugin_dir(&self.context.roots.project);
         let Some(path) = project_override else {
-            if Self::is_plugin_dir(&self.context.roots.project) {
+            if cwd_is_plugin {
                 return Err(RuntimeError::invalid(
                     "Pass explicit 'project' repository path; MCP server cwd is the plugin directory",
                 ));
@@ -91,6 +111,11 @@ impl McpServer {
             return Ok(self.context.clone());
         };
         let raw_path = Path::new(path);
+        if cwd_is_plugin && !raw_path.is_absolute() {
+            return Err(RuntimeError::invalid(
+                "Pass explicit absolute external 'project' repository path; MCP server cwd is the plugin directory",
+            ));
+        }
         let candidate = if raw_path.is_absolute() {
             raw_path.to_path_buf()
         } else {
@@ -100,7 +125,7 @@ impl McpServer {
         if !root.is_dir() {
             return Err(RuntimeError::invalid("project path must be an existing directory"));
         }
-        if Self::is_plugin_dir(&root) {
+        if Self::is_plugin_dir(&root) || Self::is_marketplace_dir(&root) {
             return Err(RuntimeError::invalid(
                 "Pass target repository path for 'project', not the plugin directory",
             ));
@@ -326,6 +351,195 @@ impl McpServer {
             return call_handoff_load(&ctx, input);
         }
 
+        let project_id = input
+            .get("project_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                ctx.roots
+                    .project
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("default")
+                    .to_string()
+            });
+
+        if name == "omnigraph_sync_canonical" {
+            let eng = OmnigraphEngine::open(&ctx)?;
+            if let Some(items) = input.get("items").and_then(Value::as_array) {
+                let prune_layers: Vec<String> = if input.get("prune").and_then(Value::as_bool).unwrap_or(true) {
+                    vec!["project-brain".into(), "memory-bank".into()]
+                } else {
+                    Vec::new()
+                };
+                return eng.sync_canonical_items(&project_id, items, &prune_layers);
+            }
+            let prune = input.get("prune").and_then(Value::as_bool).unwrap_or(true);
+            return eng.sync_canonical_workspace(&ctx, &project_id, prune);
+        }
+
+        if name == "omnigraph_file_context" {
+            let path = input["path"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| RuntimeError::invalid("path must be a non-empty string"))?;
+            let branch = input
+                .get("branch")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let eng = OmnigraphEngine::open(&ctx)?;
+            let mut res = eng.file_context(&project_id, path, branch)?;
+            let c_warnings = omnigraph::bridge::contradiction_warnings(
+                &res["contradictions"],
+                &res["atoms"],
+            );
+            res["contradiction_warnings"] = Value::Array(c_warnings);
+            return Ok(res);
+        }
+
+        if name == "omnigraph_atoms" {
+            let eng = OmnigraphEngine::open(&ctx)?;
+            let branch = input.get("branch").and_then(Value::as_str);
+            let kind = input.get("kind").and_then(Value::as_str);
+            let q = input.get("q").and_then(Value::as_str);
+            let limit = input
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+                .unwrap_or(50);
+            let offset = input
+                .get("offset")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+                .unwrap_or(0);
+            return eng.atoms_query(&project_id, branch, kind, q, limit, offset);
+        }
+
+        if name == "omnigraph_branch_diff" {
+            let source = input["source"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| RuntimeError::invalid("source branch must be a non-empty string"))?;
+            let target = input
+                .get("target")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let eng = OmnigraphEngine::open(&ctx)?;
+            return eng.branch_diff(&project_id, source, target);
+        }
+
+        if name == "omnigraph_merge_keep" {
+            let eng = OmnigraphEngine::open(&ctx)?;
+            if let Some(atom_id) = input
+                .get("atom_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                && let (Some(from), Some(to)) = (
+                    input.get("from").and_then(Value::as_str),
+                    input.get("to").and_then(Value::as_str),
+                )
+            {
+                return eng.keep_atom(
+                    atom_id,
+                    from,
+                    to,
+                    input.get("expected_updated_at").and_then(Value::as_str),
+                    input.get("replaced_updated_at").and_then(Value::as_str),
+                );
+            }
+            let source = input
+                .get("source")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| RuntimeError::invalid("Provide `source` (or `atom_id` + `from` + `to`)"))?;
+            let target = input.get("target").and_then(Value::as_str);
+            let strategy = input
+                .get("strategy")
+                .and_then(Value::as_str)
+                .unwrap_or("merge");
+            let atom_ids: Vec<String> = input
+                .get("atom_ids")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+            let dry_run = input.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+            let delete_branch = input
+                .get("delete_branch")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            return eng.merge_keep(&omnigraph::MergeKeepOptions {
+                project_id: &project_id,
+                source,
+                target,
+                strategy,
+                atom_ids: &atom_ids,
+                dry_run,
+                delete_branch,
+            });
+        }
+
+        if name == "context_memory_links_for_file" {
+            let mut specs: Vec<(String, Option<String>)> = Vec::new();
+            if let Some(path) = input
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let prev = input
+                    .get("previous_path")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                specs.push((path.to_string(), prev));
+            }
+            if let Some(arr) = input.get("files").and_then(Value::as_array) {
+                for item in arr.iter().take(128) {
+                    if let Some(s) = item.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        specs.push((s.to_string(), None));
+                    } else if let Some(obj) = item.as_object()
+                        && let Some(p) = obj
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                    {
+                        let prev = obj
+                            .get("previous_path")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        specs.push((p.to_string(), prev));
+                    }
+                }
+            }
+            if specs.is_empty() {
+                return Err(RuntimeError::invalid(
+                    "Provide non-empty `path` (or `files`) for context_memory_links_for_file",
+                ));
+            }
+            let eng = OmnigraphEngine::open(&ctx).ok();
+            return omnigraph::bridge::memory_links_for_files(
+                &ctx,
+                &project_id,
+                &specs,
+                eng.as_ref(),
+            );
+        }
+
         let task = results::task_id(
             input["task_id"]
                 .as_str()
@@ -506,8 +720,8 @@ impl McpServer {
                         object!({
                             "protocolVersion": VERSION,
                             "capabilities": {"tools": {}},
-                            "serverInfo": {"name": "context-graph", "version": "0.1.0"},
-                            "instructions": "Use memory_retrieve before complex work and material decisions, context_graph_query / context_graph_links for multi-hop provenance and impact analysis, context_export_bundle / context_import_bundle for portable bundle transfer, and context_handoff_save / context_handoff_load for portable session continuity. Never store transcripts or secrets."
+                            "serverInfo": {"name": "context-graph", "version": "0.2.0"},
+                            "instructions": "Use memory_retrieve before complex work and material decisions, check cited sources, use context_graph_query / context_graph_links for multi-hop provenance, omnigraph_sync_canonical / omnigraph_file_context / omnigraph_atoms / omnigraph_branch_diff / omnigraph_merge_keep for branchable Omnigraph context sync and conflict resolution, context_memory_links_for_file for file-level Brain/Bank citations and rename/contradiction warnings, context_export_bundle / context_import_bundle for portable bundle transfer, and memory_checkpoint / memory_record_result for task progress. Never store transcripts or secrets."
                         })
                     }
                     "ping" => object!({}),
@@ -946,7 +1160,7 @@ pub fn tools() -> Vec<Value> {
     let string = object!({"type": "string"});
     let boolean = object!({"type": "boolean"});
     let string_array = object!({"type": "array", "items": string});
-    let strings3 = object!({"type": "array", "items": string, "maxItems": 3});
+    let _strings3 = object!({"type": "array", "items": string, "maxItems": 3});
     let source_image = object!({
         "type": "array",
         "minItems": 1,
@@ -1028,20 +1242,20 @@ pub fn tools() -> Vec<Value> {
         ),
         spec(
             "memory_checkpoint",
-            "Flush working Git metadata into the existing branch/task. Return the authoritative task revision.",
+            "Flush working Git metadata into the existing branch/task. Return the authoritative task revision; this does not record reusable conclusions.",
             object!({"task_id": string, "goal": string}),
             vec!["task_id"],
             false,
         ),
         spec(
             "memory_record_result",
-            "Record sanitized progress/next steps and source-backed reusable findings/decisions.",
+            "Record sanitized progress/next steps and source-backed reusable findings/decisions before finishing, where no Stop hook asks for the native-result save; where one asks, that save is the record. Supply the current task revision and a stable result_id: exact completed replay preserves later edits, and repeating an interrupted save with the same result_id finishes it without duplicating what it already wrote. To confirm/correct inspected existing knowledge, preserve type/title/sources and include record_id, expected_revision and its complete checked source_fingerprints. A protected/conflicting learning is held individually while independent progress and valid facts save. verified=true is agent attestation, not human review. Empty learnings is valid.",
             object!({
                 "task_id": string,
                 "result_id": string,
                 "revision": {"type": "integer", "minimum": 1},
                 "progress": string,
-                "next_steps": strings3,
+                "next_steps": string_array,
                 "verified": boolean,
                 "capture_decision": {"enum": ["selected", "no_reusable_knowledge", "insufficiently_checked"]},
                 "learnings": {"type": "array", "maxItems": 3, "items": learning}
@@ -1142,6 +1356,85 @@ pub fn tools() -> Vec<Value> {
             vec![],
             true,
         ),
+        spec(
+            "omnigraph_sync_canonical",
+            "Sync active Project Brain records and Memory Bank chunks (or explicit items) into Omnigraph's knowledge/canonical branch using the canonical sync ledger, linking TouchesFile and MentionsSymbol edges and pruning retired atoms.",
+            object!({
+                "project_id": string,
+                "prune": boolean,
+                "items": {"type": "array", "items": {"type": "object"}}
+            }),
+            vec![],
+            false,
+        ),
+        spec(
+            "omnigraph_file_context",
+            "Query Omnigraph ContextAtoms touching a workspace file across main and knowledge/canonical, including named SymbolRef declarations (MentionsSymbol) and contradiction warnings.",
+            object!({
+                "path": string,
+                "branch": string,
+                "project_id": string
+            }),
+            vec!["path"],
+            true,
+        ),
+        spec(
+            "omnigraph_atoms",
+            "List or search Omnigraph ContextAtom nodes on a branch (default main; or knowledge/canonical, session/*, shared/*) with cited files and linked symbols.",
+            object!({
+                "branch": string,
+                "kind": {"enum": ["finding", "decision", "warning", "contract", "insight", "artifact", "question"]},
+                "q": string,
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                "offset": {"type": "integer", "minimum": 0},
+                "project_id": string
+            }),
+            vec![],
+            true,
+        ),
+        spec(
+            "omnigraph_branch_diff",
+            "Compute 3-way diff against merge_base between source and target Omnigraph branches (added/updated/deleted atoms, edges, and divergent_update / modify_delete conflicts).",
+            object!({
+                "source": string,
+                "target": string,
+                "project_id": string
+            }),
+            vec!["source"],
+            true,
+        ),
+        spec(
+            "omnigraph_merge_keep",
+            "Merge Omnigraph branches or resolve conflicting ContextAtoms using strategy (merge, keep_source, keep_target) or single-atom verbatim keep (atom_id + from + to with optimistic updated_at checks).",
+            object!({
+                "source": string,
+                "target": string,
+                "strategy": {"enum": ["merge", "keep_source", "keep_target"]},
+                "atom_ids": string_array,
+                "atom_id": string,
+                "from": string,
+                "to": string,
+                "expected_updated_at": string,
+                "replaced_updated_at": string,
+                "dry_run": boolean,
+                "delete_branch": boolean,
+                "project_id": string
+            }),
+            vec![],
+            false,
+        ),
+        spec(
+            "context_memory_links_for_file",
+            "Resolve cited Project Brain records, active Memory Bank chunks, hygiene warnings (cited-file-missing, cited-file-renamed via previous_path), and Omnigraph contradiction warnings for one or more workspace files.",
+            object!({
+                "path": string,
+                "previous_path": string,
+                "files": {"type": "array", "maxItems": 128},
+                "project_id": string
+            }),
+            vec![],
+            true,
+        ),
     ]
 }
 
@@ -1158,16 +1451,57 @@ mod tests {
     }
 
     #[test]
-    fn mcp_server_lists_11_tools_and_executes_graph_and_handoff_roundtrip() {
+    fn mcp_server_lists_17_tools_and_executes_omnigraph_and_handoff_roundtrip() {
         let root = TempDir(std::env::temp_dir().join(format!(
             "cg-mcp-test-{}",
             domain::uuid4()
         )));
         std::fs::create_dir_all(root.0.join("src")).unwrap();
-        std::fs::write(root.0.join("src/lib.rs"), "pub fn init() {}\n").unwrap();
+        std::fs::write(
+            root.0.join("src/lib.rs"),
+            "pub struct OrderGuard {}\npub fn verify_order() {}\n",
+        )
+        .unwrap();
 
         let roots = Roots::installed(&root.0).unwrap();
         let ctx = RuntimeContext::new(roots, "tester", "governed").unwrap();
+        let eng = OmnigraphEngine::open(&ctx).unwrap();
+        eng.publish_atom(&object!({
+            "atom_id": "atom-1",
+            "project_id": "proj",
+            "branch": "main",
+            "kind": "decision",
+            "title": "Verify order guard",
+            "body": "Call OrderGuard::verify_order before dispatch.",
+            "files": ["src/lib.rs"],
+            "updated_at": "2026-11-24T10:00:00Z"
+        }))
+        .unwrap();
+        eng.create_branch("session/s1", Some("main")).unwrap();
+        eng.publish_atom(&object!({
+            "atom_id": "atom-1",
+            "project_id": "proj",
+            "branch": "session/s1",
+            "kind": "decision",
+            "title": "Verify order guard v2",
+            "body": "Updated in session.",
+            "files": ["src/lib.rs"],
+            "updated_at": "2026-11-24T10:01:00Z"
+        }))
+        .unwrap();
+        eng.publish_atom(&object!({
+            "atom_id": "atom-1",
+            "project_id": "proj",
+            "branch": "main",
+            "kind": "decision",
+            "title": "Verify order guard main",
+            "body": "Updated in main.",
+            "files": ["src/lib.rs"],
+            "updated_at": "2026-11-24T10:02:00Z"
+        }))
+        .unwrap();
+        drop(eng);
+
         let server = McpServer::new(ctx, "claude").unwrap();
 
         let requests = [
@@ -1192,6 +1526,30 @@ mod tests {
                 "name": "context_handoff_load",
                 "arguments": {"task_id": "TASK-MCP-1", "latest": true}
             }}),
+            object!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {
+                "name": "omnigraph_sync_canonical",
+                "arguments": {"project_id": "proj"}
+            }}),
+            object!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {
+                "name": "omnigraph_file_context",
+                "arguments": {"path": "src/lib.rs", "project_id": "proj"}
+            }}),
+            object!({"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {
+                "name": "omnigraph_atoms",
+                "arguments": {"branch": "main", "project_id": "proj"}
+            }}),
+            object!({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {
+                "name": "omnigraph_branch_diff",
+                "arguments": {"source": "session/s1", "target": "main", "project_id": "proj"}
+            }}),
+            object!({"jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {
+                "name": "omnigraph_merge_keep",
+                "arguments": {"source": "session/s1", "target": "main", "strategy": "keep_source", "project_id": "proj"}
+            }}),
+            object!({"jsonrpc": "2.0", "id": 11, "method": "tools/call", "params": {
+                "name": "context_memory_links_for_file",
+                "arguments": {"path": "src/lib.rs", "project_id": "proj"}
+            }}),
         ];
 
         let wire = requests
@@ -1205,19 +1563,58 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 11);
         assert_eq!(
             lines[1]["result"]["tools"].as_array().unwrap().len(),
-            11
+            17
         );
-        assert_eq!(lines[2]["result"]["isError"], false, "{:#}", lines[2]);
-        assert_eq!(lines[3]["result"]["isError"], false, "{:#}", lines[3]);
+        for (idx, line) in lines.iter().enumerate().take(11).skip(2) {
+            assert_eq!(line["result"]["isError"], false, "line {idx}: {:#}", line);
+        }
         assert!(
             !lines[3]["result"]["structuredContent"]["edges"]
                 .as_array()
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(lines[4]["result"]["isError"], false, "{:#}", lines[4]);
+        assert_eq!(lines[6]["result"]["structuredContent"]["atoms"][0]["atom_id"], "atom-1");
+        assert_eq!(lines[8]["result"]["structuredContent"]["outcome"], "conflict");
+        assert_eq!(lines[9]["result"]["structuredContent"]["outcome"], "merged");
+    }
+
+    #[test]
+    fn mcp_plugin_cwd_guard_rejects_omitted_or_plugin_project_arg() {
+        let plugin_dir = TempDir(std::env::temp_dir().join(format!(
+            "cg-plugin-dir-{}",
+            domain::uuid4()
+        )));
+        std::fs::create_dir_all(plugin_dir.0.join(".claude-plugin")).unwrap();
+        std::fs::write(plugin_dir.0.join(".claude-plugin/plugin.json"), "{}").unwrap();
+        let roots = Roots::installed(&plugin_dir.0).unwrap();
+        let ctx = RuntimeContext::new(roots, "tester", "governed").unwrap();
+        let server = McpServer::new(ctx, "claude").unwrap();
+
+        for bad_args in [
+            object!({}),
+            object!({"project": ""}),
+            object!({"project": "."}),
+            object!({"project": "./."}),
+            object!({"project": ".."}),
+        ] {
+            let err = server.call("omnigraph_atoms", &bad_args).unwrap_err();
+            assert!(
+                err.message.contains("MCP server cwd is the plugin directory"),
+                "unexpected error for {bad_args}: {}",
+                err.message
+            );
+        }
+
+        let err2 = server
+            .call(
+                "omnigraph_file_context",
+                &object!({"path": "src/lib.rs", "project": plugin_dir.0.to_string_lossy()}),
+            )
+            .unwrap_err();
+        assert!(err2.message.contains("not the plugin directory"));
     }
 }
