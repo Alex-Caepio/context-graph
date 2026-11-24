@@ -536,24 +536,30 @@ fn run_import(args: &[String]) -> Result<i32> {
 fn run_hook(args: &[String]) -> Result<i32> {
     let mut positional: Vec<String> = Vec::new();
     let mut root: Option<PathBuf> = None;
+    let mut explicit_host: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let (flag, _) = split_flag_arg(&args[i]);
         match flag {
-            "--root" => root = Some(PathBuf::from(next_val(args, &mut i, flag)?)),
+            "--root" | "--project" => root = Some(PathBuf::from(next_val(args, &mut i, flag)?)),
+            "--host" => explicit_host = Some(next_val(args, &mut i, flag)?.into()),
             other if !other.starts_with('-') => positional.push(other.to_string()),
             other => return Err(RuntimeError::invalid(format!("Unknown hook option: {other}"))),
         }
         i += 1;
     }
 
-    let (host, role) = match positional.as_slice() {
-        [host, role] => (host.clone(), role.clone()),
-        [role] => {
+    let raw = read_stdin_capped()?;
+    let (host, role) = match (explicit_host, positional.as_slice()) {
+        (Some(h), [role]) => (h, role.clone()),
+        (None, [host, role]) => (host.clone(), role.clone()),
+        (None, [role]) => {
             let h = if std::env::var_os("CODEX_THREAD_ID").is_some()
                 || std::env::var_os("CODEX_HOME").is_some()
             {
                 "codex"
+            } else if hooks::looks_like_antigravity_raw(&raw) {
+                "antigravity"
             } else {
                 "claude"
             };
@@ -561,12 +567,11 @@ fn run_hook(args: &[String]) -> Result<i32> {
         }
         _ => {
             return Err(RuntimeError::invalid(
-                "hook usage: context-graph-engine hook [claude|codex|cursor] <role> [--root DIR]",
+                "hook usage: context-graph-engine hook [antigravity|agy|claude|codex|cursor] <role> [--root DIR] [--host HOST]",
             ));
         }
     };
 
-    let raw = read_stdin_capped()?;
     let root_path = root.unwrap_or_else(|| PathBuf::from("."));
     let out = hooks::execute(&root_path, &host, &role, &raw)?;
     Ok(out.write()?)

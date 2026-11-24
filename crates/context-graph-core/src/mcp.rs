@@ -24,14 +24,27 @@ pub const VERSION: &str = "2025-06-18";
 pub const MAX_MESSAGE: usize = 128 * 1024;
 pub const MAX_DEPTH: usize = 64;
 
+fn is_plugin_cache_path(dir: &Path) -> bool {
+    let norm = dir.to_string_lossy().replace('\\', "/");
+    norm.contains("/.gemini/config/plugins/")
+        || norm.ends_with("/.gemini/config/plugins")
+        || norm.contains("/.claude/plugins/cache/")
+        || norm.contains("/.codex/plugins/cache/")
+}
+
 fn is_plugin_marker_root(dir: &Path) -> bool {
     dir.join(".codex-plugin/plugin.json").is_file()
         || dir.join(".claude-plugin/plugin.json").is_file()
-        || (dir.join(".mcp.json").is_file() && dir.join("bin/context-graph-engine").is_file())
+        || dir.join(".antigravity-plugin/plugin.json").is_file()
+        || dir.join(".gemini-plugin/plugin.json").is_file()
+        || ((dir.join(".mcp.json").is_file()
+            || dir.join("mcp_config.json").is_file()
+            || dir.join("plugin.json").is_file())
+            && dir.join("bin/context-graph-engine").is_file())
 }
 
 pub fn is_plugin_dir(dir: &Path) -> bool {
-    dir.ancestors().any(is_plugin_marker_root)
+    is_plugin_cache_path(dir) || dir.ancestors().any(is_plugin_marker_root)
 }
 
 pub fn is_marketplace_dir(dir: &Path) -> bool {
@@ -1616,5 +1629,30 @@ mod tests {
             )
             .unwrap_err();
         assert!(err2.message.contains("not the plugin directory"));
+
+        // Antigravity extension cache path (`.gemini/config/plugins/<name>`) is also guarded.
+        let agy_dir = TempDir(std::env::temp_dir().join(format!(
+            "cg-agy-cache-{}/.gemini/config/plugins/context-graph",
+            domain::uuid4()
+        )));
+        std::fs::create_dir_all(agy_dir.0.join("bin")).unwrap();
+        std::fs::write(agy_dir.0.join("plugin.json"), r#"{"name":"context-graph"}"#).unwrap();
+        std::fs::write(agy_dir.0.join("mcp_config.json"), r#"{"mcpServers":{}}"#).unwrap();
+        assert!(is_plugin_dir(&agy_dir.0));
+        let agy_roots = Roots::installed(&agy_dir.0).unwrap();
+        let agy_ctx = RuntimeContext::new(agy_roots, "tester", "governed").unwrap();
+        let agy_srv = McpServer::new(agy_ctx, "antigravity").unwrap();
+        for bad in [object!({}), object!({"project": "."}), object!({"project": ""})] {
+            assert!(agy_srv.call("omnigraph_atoms", &bad).is_err());
+        }
+        let target = TempDir(std::env::temp_dir().join(format!("cg-agy-target-{}", domain::uuid4())));
+        std::fs::create_dir_all(target.0.join("src")).unwrap();
+        let ok = agy_srv
+            .call(
+                "omnigraph_atoms",
+                &object!({"project": target.0.to_string_lossy()}),
+            )
+            .unwrap();
+        assert_eq!(ok["ok"], true);
     }
 }

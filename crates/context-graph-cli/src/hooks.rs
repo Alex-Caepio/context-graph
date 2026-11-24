@@ -155,8 +155,149 @@ impl HookOutput {
 pub fn passed(host: &str, role: &str) -> HookOutput {
     if host == "cursor" && role == "working-memory-read" {
         HookOutput::text("{\"continue\": true}\n")
+    } else if matches!(host, "antigravity" | "agy") {
+        HookOutput::text("{}\n")
     } else {
         HookOutput::default()
+    }
+}
+
+pub fn looks_like_antigravity_payload(payload: &Value) -> bool {
+    payload.get("workspacePaths").is_some()
+        || payload.get("hookEventName").is_some()
+        || payload.get("conversationId").is_some()
+        || payload.get("toolCall").is_some()
+}
+
+pub fn looks_like_antigravity_raw(raw: &[u8]) -> bool {
+    looks_like_antigravity_payload(&parse_payload(raw))
+}
+
+fn canonical_host(host: &str, payload: &Value) -> &'static str {
+    match host.trim() {
+        "antigravity" | "agy" => "antigravity",
+        "codex" => "codex",
+        "cursor" => "cursor",
+        "claude" if looks_like_antigravity_payload(payload) => "antigravity",
+        "claude" => "claude",
+        _ => "unsupported",
+    }
+}
+
+fn extract_root_candidate(payload: &Value) -> Option<PathBuf> {
+    valid_abs_path(payload["cwd"].as_str(), 4096)
+        .filter(|p| p.is_dir())
+        .or_else(|| {
+            payload["workspacePaths"]
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(Value::as_str)
+                .and_then(|s| valid_abs_path(Some(s), 4096))
+                .filter(|p| p.is_dir())
+        })
+}
+
+fn antigravity_event_name(payload: &Value) -> Option<&str> {
+    payload["hookEventName"]
+        .as_str()
+        .or_else(|| payload["hook_event_name"].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn normalize_antigravity_payload(role: &str, payload: &Value) -> Value {
+    let mut map = payload.as_object().cloned().unwrap_or_default();
+    if map
+        .get("cwd")
+        .and_then(Value::as_str)
+        .is_none_or(|s| s.trim().is_empty())
+        && let Some(ws0) = extract_root_candidate(payload)
+    {
+        map.insert("cwd".into(), Value::String(ws0.to_string_lossy().into_owned()));
+    }
+    if map
+        .get("session_id")
+        .and_then(Value::as_str)
+        .is_none_or(|s| s.trim().is_empty())
+        && let Some(cid) = payload["conversation_id"]
+            .as_str()
+            .or_else(|| payload["conversationId"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        map.insert("session_id".into(), Value::String(cid.to_string()));
+    }
+    if map
+        .get("transcript_path")
+        .and_then(Value::as_str)
+        .is_none_or(|s| s.trim().is_empty())
+        && let Some(tp) = payload["transcriptPath"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        map.insert("transcript_path".into(), Value::String(tp.to_string()));
+    }
+    if map
+        .get("prompt")
+        .and_then(Value::as_str)
+        .is_none_or(|s| s.trim().is_empty())
+        && let Some(p) = payload["userPrompt"]
+            .as_str()
+            .or_else(|| payload["query"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        map.insert("prompt".into(), Value::String(p.to_string()));
+    }
+    let event = match antigravity_event_name(payload) {
+        Some("Stop") => "Stop",
+        Some("SessionStart" | "sessionStart") => "SessionStart",
+        Some("PreInvocation") if role == "context-continuity" => "SessionStart",
+        Some("UserPromptSubmit") => "UserPromptSubmit",
+        _ if role == "working-memory-write" => "Stop",
+        _ if role == "local-context" => "SessionStart",
+        _ => "UserPromptSubmit",
+    };
+    map.insert("hook_event_name".into(), Value::String(event.to_string()));
+    Value::Object(map)
+}
+
+fn unwrap_context_text(stdout: &[u8]) -> String {
+    if stdout.is_empty() {
+        return String::new();
+    }
+    if let Ok(val) = serde_json::from_slice::<Value>(stdout)
+        && val.is_object()
+    {
+        return val["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .or_else(|| val["additionalContext"].as_str())
+            .or_else(|| val["additional_context"].as_str())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+    }
+    String::from_utf8_lossy(stdout).trim().to_string()
+}
+
+fn format_antigravity_output(role: &str, hook_event: Option<&str>, raw_out: HookOutput) -> HookOutput {
+    let is_stop = role == "working-memory-write"
+        || (role == "context-continuity" && hook_event == Some("Stop"));
+    if is_stop {
+        return HookOutput::text("{}\n");
+    }
+    let text = unwrap_context_text(&raw_out.stdout);
+    if text.is_empty() {
+        HookOutput::text("{}\n")
+    } else {
+        let json_out = object!({
+            "injectSteps": [{
+                "systemMessage": {
+                    "systemMessage": text
+                }
+            }]
+        });
+        HookOutput::text(format!("{json_out}\n"))
     }
 }
 
@@ -185,7 +326,7 @@ fn parse_payload(raw: &[u8]) -> Value {
 
 fn resolve_hook_roots(root: &Path, payload: &Value) -> Result<Option<(Roots, Option<String>)>> {
     let mut candidate = root.to_path_buf();
-    if let Some(cwd) = valid_abs_path(payload["cwd"].as_str(), 4096).filter(|p| p.is_dir())
+    if let Some(cwd) = extract_root_candidate(payload)
         && (candidate == Path::new(".") || is_plugin_dir(&candidate))
     {
         candidate = cwd;
@@ -1057,30 +1198,60 @@ fn context_continuity(roots: &Roots, host: &str, payload: &Value, raw: &[u8]) ->
 }
 
 pub fn execute(root: &Path, host: &str, role: &str, raw: &[u8]) -> Result<HookOutput> {
-    if !["claude", "codex", "cursor"].contains(&host) {
-        return Err(RuntimeError::invalid("Unsupported hook host"));
-    }
     if !ROLES.contains(&role) {
         return Err(RuntimeError::invalid(format!("Unknown hook role: {role}")));
     }
-    if std::env::var("CONTEXT_MEMORY_RECOVERY").as_deref() == Ok("1") {
-        return Ok(passed(host, role));
-    }
     let payload = parse_payload(raw);
+    let effective_host = canonical_host(host, &payload);
+    if effective_host == "unsupported" {
+        return Err(RuntimeError::invalid("Unsupported hook host"));
+    }
+    if std::env::var("CONTEXT_MEMORY_RECOVERY").as_deref() == Ok("1") {
+        return Ok(passed(effective_host, role));
+    }
     let resolved = match resolve_hook_roots(root, &payload) {
         Ok(Some(v)) => v,
-        _ => return Ok(passed(host, role)),
+        _ => return Ok(passed(effective_host, role)),
     };
     let (roots, task) = resolved;
+    if effective_host == "antigravity" {
+        let hook_event = antigravity_event_name(&payload).map(str::to_string);
+        let norm_payload = normalize_antigravity_payload(role, &payload);
+        let norm_raw = serde_json::to_vec(&norm_payload).unwrap_or_else(|_| raw.to_vec());
+        let res = match role {
+            "working-memory-read" => {
+                working_memory_read(&roots, task.as_deref(), "claude", &norm_payload, &norm_raw)
+            }
+            "working-memory-write" => {
+                working_memory_write(&roots, task.as_deref(), "claude", &norm_payload, &norm_raw)
+            }
+            "local-context" => local_context(&roots, task.as_deref()),
+            "context-continuity" => {
+                if hook_event.as_deref() == Some("PreInvocation")
+                    && norm_payload.get("transcript_path").is_some()
+                {
+                    let mut cap = norm_payload.clone();
+                    cap["hook_event_name"] = object!("UserPromptSubmit");
+                    let cap_raw = serde_json::to_vec(&cap).unwrap_or_default();
+                    let _ = context_continuity(&roots, "claude", &cap, &cap_raw);
+                }
+                context_continuity(&roots, "claude", &norm_payload, &norm_raw)
+            }
+            _ => Ok(HookOutput::default()),
+        };
+        let inner = res.unwrap_or_default();
+        return Ok(format_antigravity_output(role, hook_event.as_deref(), inner));
+    }
+
     let res = match role {
-        "working-memory-read" => working_memory_read(&roots, task.as_deref(), host, &payload, raw),
-        "working-memory-write" => working_memory_write(&roots, task.as_deref(), host, &payload, raw),
+        "working-memory-read" => working_memory_read(&roots, task.as_deref(), effective_host, &payload, raw),
+        "working-memory-write" => working_memory_write(&roots, task.as_deref(), effective_host, &payload, raw),
         "local-context" => local_context(&roots, task.as_deref()),
-        "context-continuity" => context_continuity(&roots, host, &payload, raw),
-        _ => Ok(passed(host, role)),
+        "context-continuity" => context_continuity(&roots, effective_host, &payload, raw),
+        _ => Ok(passed(effective_host, role)),
     };
     // Memory hooks never refuse/block the host turn.
-    Ok(res.unwrap_or_else(|_| passed(host, role)))
+    Ok(res.unwrap_or_else(|_| passed(effective_host, role)))
 }
 
 #[cfg(test)]
@@ -1131,6 +1302,68 @@ mod tests {
         }
         let rec2 = refresh_preflight_snapshot(&roots, Some("TASK-1"), "claude", &payload, "check billing", now_settled).unwrap();
         assert!(!refresh_preflight_matches(&rec1, &rec2));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn antigravity_hooks_parse_workspace_paths_conversation_id_and_format_inject_steps_or_empty() {
+        let root = std::env::temp_dir().join(format!("cg-agy-hooks-{}", uuid4()));
+        std::fs::create_dir_all(root.join("memory-bank/chunks")).unwrap();
+        std::fs::create_dir_all(root.join("project-brain")).unwrap();
+
+        // SessionStart via workspacePaths[0] + conversationId + `agy` alias
+        let session_payload = object!({
+            "hookEventName": "SessionStart",
+            "workspacePaths": [root.to_string_lossy()],
+            "conversationId": "conv-agy-1"
+        })
+        .to_string();
+        let out_lc = execute(Path::new("."), "agy", "local-context", session_payload.as_bytes()).unwrap();
+        assert_eq!(out_lc.code, 0);
+        let parsed_lc: Value = serde_json::from_slice(&out_lc.stdout).unwrap();
+        let msg = parsed_lc["injectSteps"][0]["systemMessage"]["systemMessage"]
+            .as_str()
+            .unwrap();
+        assert!(msg.contains("Context Graph ready."), "{parsed_lc}");
+
+        // Stop -> always `{}` on stdout and exit 0
+        let stop_payload = object!({
+            "hookEventName": "Stop",
+            "workspacePaths": [root.to_string_lossy()],
+            "conversationId": "conv-agy-1"
+        })
+        .to_string();
+        let out_stop_wm = execute(Path::new("."), "antigravity", "working-memory-write", stop_payload.as_bytes()).unwrap();
+        assert_eq!(out_stop_wm.code, 0);
+        assert_eq!(serde_json::from_slice::<Value>(&out_stop_wm.stdout).unwrap(), object!({}));
+
+        let out_stop_cc = execute(Path::new("."), "antigravity", "context-continuity", stop_payload.as_bytes()).unwrap();
+        assert_eq!(out_stop_cc.code, 0);
+        assert_eq!(serde_json::from_slice::<Value>(&out_stop_cc.stdout).unwrap(), object!({}));
+
+        // PreInvocation empty context-continuity -> `{}`
+        let pre_payload = object!({
+            "hookEventName": "PreInvocation",
+            "workspacePaths": [root.to_string_lossy()],
+            "conversationId": "conv-agy-1"
+        })
+        .to_string();
+        let out_pre_cc = execute(Path::new("."), "antigravity", "context-continuity", pre_payload.as_bytes()).unwrap();
+        assert_eq!(out_pre_cc.code, 0);
+        assert_eq!(serde_json::from_slice::<Value>(&out_pre_cc.stdout).unwrap(), object!({}));
+
+        // Non-empty Claude hookSpecificOutput unwraps into injectSteps cleanly
+        let wrapped = format_antigravity_output(
+            "context-continuity",
+            Some("PreInvocation"),
+            HookOutput::text(r#"{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"Restored context"}}"#),
+        );
+        let wrapped_val: Value = serde_json::from_slice(&wrapped.stdout).unwrap();
+        assert_eq!(
+            wrapped_val["injectSteps"][0]["systemMessage"]["systemMessage"],
+            "Restored context"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

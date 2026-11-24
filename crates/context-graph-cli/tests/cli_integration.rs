@@ -549,3 +549,201 @@ fn omnigraph_cli_sync_branch_diff_keep_bridge_and_promote_roundtrip() {
     let links_json: Value = serde_json::from_slice(&links.stdout).unwrap();
     assert_eq!(links_json["items"][0]["brain_records"].as_array().unwrap().len(), 1);
 }
+
+#[test]
+fn antigravity_hooks_emit_inject_steps_stop_empty_and_workspace_paths() {
+    let tmp = TempDir(std::env::temp_dir().join(format!("cg-agy-hook-rt-{}", uuid4())));
+    let caller_cwd = tmp.0.join("caller");
+    let empty_repo = tmp.0.join("empty-repo");
+    let repo = tmp.0.join("repo");
+    fs::create_dir_all(&caller_cwd).unwrap();
+    fs::create_dir_all(&empty_repo).unwrap();
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(repo.join("src/app.rs"), "fn billing() {}\n").unwrap();
+    let git_init = Command::new("git")
+        .args(["init", "-q", "-b", "TASK-AGY-1"])
+        .current_dir(&repo)
+        .output()
+        .expect("git init");
+    assert!(
+        git_init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&git_init.stderr)
+    );
+
+    let r = repo.to_str().unwrap();
+    let start = run_cli(
+        &repo,
+        &[
+            "memory",
+            "start",
+            "--root",
+            r,
+            "--task-id",
+            "TASK-AGY-1",
+            "--goal",
+            "Verify Antigravity hooks",
+        ],
+        None,
+    );
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let idx = run_cli(&repo, &["memory", "index", "--root", r], None);
+    assert!(
+        idx.status.success(),
+        "{}",
+        String::from_utf8_lossy(&idx.stderr)
+    );
+
+    let session_payload = json!({
+        "hookEventName": "SessionStart",
+        "workspacePaths": [r],
+        "conversationId": "conv-agy-1"
+    })
+    .to_string();
+    let lc = run_cli(&caller_cwd, &["hook", "antigravity", "local-context"], Some(&session_payload));
+    assert_eq!(lc.status.code(), Some(0), "{}", String::from_utf8_lossy(&lc.stderr));
+    let lc_json: Value = serde_json::from_slice(&lc.stdout).unwrap();
+    assert!(lc_json.get("hookSpecificOutput").is_none());
+    let lc_msg = lc_json["injectSteps"][0]["systemMessage"]["systemMessage"]
+        .as_str()
+        .expect("injectSteps systemMessage");
+    assert!(lc_msg.contains("Context Graph ready."));
+    assert!(lc_msg.contains("Branch: TASK-AGY-1"));
+
+    let pre_payload = json!({
+        "hookEventName": "PreInvocation",
+        "workspacePaths": [r],
+        "conversationId": "conv-agy-1",
+        "userPrompt": "Verify Antigravity hooks"
+    })
+    .to_string();
+    let wmr = run_cli(
+        &caller_cwd,
+        &["hook", "agy", "working-memory-read"],
+        Some(&pre_payload),
+    );
+    assert_eq!(wmr.status.code(), Some(0), "{}", String::from_utf8_lossy(&wmr.stderr));
+    let wmr_json: Value = serde_json::from_slice(&wmr.stdout).unwrap();
+    assert!(wmr_json.get("hookSpecificOutput").is_none());
+    let wmr_msg = wmr_json["injectSteps"][0]["systemMessage"]["systemMessage"]
+        .as_str()
+        .expect("working-memory-read injectSteps");
+    assert!(wmr_msg.contains("TASK-AGY-1"));
+
+    let empty_pre = json!({
+        "hookEventName": "PreInvocation",
+        "workspacePaths": [empty_repo],
+        "conversationId": "conv-agy-empty",
+        "userPrompt": "no task context yet"
+    })
+    .to_string();
+    let wmr_empty = run_cli(
+        &caller_cwd,
+        &["hook", "antigravity", "working-memory-read"],
+        Some(&empty_pre),
+    );
+    assert_eq!(wmr_empty.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&wmr_empty.stdout).unwrap(),
+        json!({})
+    );
+
+    let cc_pre = run_cli(
+        &caller_cwd,
+        &["hook", "antigravity", "context-continuity"],
+        Some(&pre_payload),
+    );
+    assert_eq!(
+        cc_pre.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&cc_pre.stderr)
+    );
+    let cc_pre_json: Value = serde_json::from_slice(&cc_pre.stdout).unwrap();
+    assert_eq!(cc_pre_json, json!({}));
+
+    let stop_payload = json!({
+        "hookEventName": "Stop",
+        "workspacePaths": [r],
+        "conversationId": "conv-agy-1"
+    })
+    .to_string();
+    for args in [
+        vec!["hook", "antigravity", "working-memory-write"],
+        vec!["hook", "antigravity", "context-continuity"],
+        vec!["hook", "working-memory-write"],
+    ] {
+        let out = run_cli(&caller_cwd, &args, Some(&stop_payload));
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let parsed: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(parsed, json!({}), "{:?}: {}", args, parsed);
+    }
+}
+
+#[test]
+fn mcp_binary_refuses_omitted_and_dot_in_antigravity_gemini_plugin_cache() {
+    let tmp = TempDir(std::env::temp_dir().join(format!("cg-agy-mcp-guard-{}", uuid4())));
+    fs::create_dir_all(tmp.0.join(".git")).unwrap();
+    let agy_plugin_dir = tmp.0.join(".gemini/config/plugins/context-graph");
+    fs::create_dir_all(agy_plugin_dir.join("bin")).unwrap();
+    fs::write(
+        agy_plugin_dir.join("plugin.json"),
+        r#"{"name":"context-graph"}"#,
+    )
+    .unwrap();
+    fs::write(
+        agy_plugin_dir.join("mcp_config.json"),
+        r#"{"mcpServers":{"context-graph":{"command":"bin/context-graph-engine","args":["mcp"]}}}"#,
+    )
+    .unwrap();
+    fs::write(agy_plugin_dir.join("bin/context-graph-engine"), b"").unwrap();
+
+    let target_repo = tmp.0.join("target-repo");
+    fs::create_dir_all(target_repo.join("src")).unwrap();
+    fs::write(target_repo.join("src/app.rs"), "fn main() {}\n").unwrap();
+
+    let requests = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "omnigraph_atoms", "arguments": {}}}),
+        json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "omnigraph_atoms", "arguments": {"project": ""}}}),
+        json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "omnigraph_atoms", "arguments": {"project": "."}}}),
+        json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "omnigraph_atoms", "arguments": {"project": "./."}}}),
+        json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "omnigraph_atoms", "arguments": {"project": target_repo}}}),
+    ];
+    let wire = requests
+        .iter()
+        .map(|v| serde_json::to_string(v).unwrap() + "\n")
+        .collect::<String>();
+
+    let out = run_cli(&agy_plugin_dir, &["mcp"], Some(&wire));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let responses: Vec<Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 7);
+    assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 17);
+    for resp in &responses[2..=5] {
+        assert_eq!(resp["result"]["isError"], true, "{resp:#}");
+    }
+    assert_eq!(responses[6]["result"]["isError"], false, "{:#}", responses[6]);
+    assert!(!agy_plugin_dir.join("memory-bank").exists());
+    assert!(!agy_plugin_dir.join("project-brain").exists());
+}
